@@ -1,0 +1,6 @@
+{
+  "name": "Multi Gestor PRO - Gestão Multinegócios, Cobranças, IPTV e WhatsApp",
+  "description": "Sistema completo de gestão multinegócios (IPTV, Empréstimos, Assinaturas, Vendas), automação de disparos via WhatsApp (Baileys nativo), pagamentos PIX via Mercado Pago e banco em nuvem Supabase.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
