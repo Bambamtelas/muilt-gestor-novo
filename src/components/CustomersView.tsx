@@ -1096,11 +1096,7 @@ export const CustomersView: React.FC<CustomersViewProps> = ({
                   const toDeleteId = customerToDelete.id;
                   setCustomerToDelete(null);
                   try {
-                    if (isSupabaseConfigured && tenant?.id) {
-                      await deleteCustomerFromSupabase(tenant.id, toDeleteId);
-                      broadcastChange('delete', { id: toDeleteId, tenantId: tenant.id });
-                    }
-                    onDeleteCustomer(toDeleteId);
+                    await onDeleteCustomer(toDeleteId);
                     setToastMessage('Cliente excluído com sucesso.');
                     setTimeout(() => setToastMessage(null), 3000);
                   } catch (err: any) {

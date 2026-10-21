@@ -120,6 +120,8 @@ class DataStore {
   // 6. Automação WhatsApp & Logs
   public whatsappConfigs: Record<string, WhatsAppAutomationConfig> = {};
   public whatsappDispatchLogs: WhatsAppDispatchLog[] = [];
+  // Trava de concorrência por tenant para impedir disparos paralelos/duplicados
+  private isDispatchingMap: Map<string, boolean> = new Map();
 
   // 7. Link Promocional / Lojinha Online (Global para todos os painéis e módulos)
   public externalLinkConfig: ExternalLinkConfig = { ...DEFAULT_EXTERNAL_LINK_CONFIG };
@@ -1186,32 +1188,29 @@ class DataStore {
         const client = getSupabaseClient();
         if (client) {
           const { data, error } = await client.from('customers').select('*').eq('tenant_id', tenantId);
-          if (!error && data && data.length > 0) {
-            for (const c of data) {
-              const mapped: Customer = {
-                id: c.id,
-                tenant_id: c.tenant_id,
-                name: c.name,
-                trade_name: c.trade_name || undefined,
-                document: c.document || undefined,
-                whatsapp: c.whatsapp || c.phone || undefined,
-                email: c.email || undefined,
-                address_street: c.street || c.address_street || undefined,
-                address_number: c.number || c.address_number || undefined,
-                address_neighborhood: c.neighborhood || c.address_neighborhood || undefined,
-                address_city: c.city || c.address_city || undefined,
-                address_state: c.state || c.address_state || undefined,
-                notes: c.notes || undefined,
-                created_at: c.created_at || new Date().toISOString(),
-                updated_at: c.updated_at || new Date().toISOString(),
-              };
-              const idx = this.customers.findIndex((local) => local.id === mapped.id);
-              if (idx >= 0) {
-                this.customers[idx] = { ...this.customers[idx], ...mapped };
-              } else {
-                this.customers.push(mapped);
-              }
-            }
+          if (!error && Array.isArray(data)) {
+            const diskCusts = this.loadFile<Customer>(FILE_BUSINESS_CUSTOMERS) || this.customers;
+            const otherCustomers = (Array.isArray(diskCusts) ? diskCusts : this.customers).filter(
+              (c) => c.tenant_id !== tenantId
+            );
+            const mappedTenantCustomers: Customer[] = data.map((c: any) => ({
+              id: c.id,
+              tenant_id: c.tenant_id,
+              name: c.name,
+              trade_name: c.trade_name || undefined,
+              document: c.document || undefined,
+              whatsapp: c.whatsapp || c.phone || undefined,
+              email: c.email || undefined,
+              address_street: c.street || c.address_street || undefined,
+              address_number: c.number || c.address_number || undefined,
+              address_neighborhood: c.neighborhood || c.address_neighborhood || undefined,
+              address_city: c.city || c.address_city || undefined,
+              address_state: c.state || c.address_state || undefined,
+              notes: c.notes || undefined,
+              created_at: c.created_at || new Date().toISOString(),
+              updated_at: c.updated_at || new Date().toISOString(),
+            }));
+            this.customers = [...otherCustomers, ...mappedTenantCustomers];
             this.saveFile(FILE_BUSINESS_CUSTOMERS, this.customers);
           }
         }
@@ -1315,28 +1314,36 @@ class DataStore {
   }
 
   public deleteCustomer(id: string): boolean {
+    const diskCusts = this.loadFile<Customer>(FILE_BUSINESS_CUSTOMERS);
+    if (diskCusts && Array.isArray(diskCusts)) this.customers = diskCusts;
+    const diskCharges = this.loadFile<Charge>(FILE_BUSINESS_SALES);
+    if (diskCharges && Array.isArray(diskCharges)) this.charges = diskCharges;
+
     const initialLen = this.customers.length;
     this.customers = this.customers.filter((c) => c.id !== id);
     // Also remove customer charges
     this.charges = this.charges.filter((ch) => ch.customer_id !== id);
     const deleted = this.customers.length < initialLen;
-    if (deleted) this.persist();
+    this.saveFile(FILE_BUSINESS_CUSTOMERS, this.customers);
+    this.saveFile(FILE_BUSINESS_SALES, this.charges);
+    this.persist();
     return deleted;
   }
 
   public async deleteCustomerAsync(id: string): Promise<boolean> {
     const deleted = this.deleteCustomer(id);
-    if (deleted && isSupabaseConfigured()) {
+    if (isSupabaseConfigured()) {
       try {
         const client = getSupabaseClient();
         if (client) {
+          await client.from('charges').delete().eq('customer_id', id);
           await client.from('customers').delete().eq('id', id);
         }
       } catch (err) {
         console.warn('[Direct Supabase Delete Customer warn]', err);
       }
     }
-    return deleted;
+    return true;
   }
 
   // Charges
@@ -2719,6 +2726,12 @@ class DataStore {
       overdue_days_limit: 30,
       second_scheduled_time_enabled: false,
       second_scheduled_time: '15:00',
+      morning_schedule_enabled: true,
+      morning_schedule_time: '09:00',
+      afternoon_schedule_enabled: false,
+      afternoon_schedule_time: '14:30',
+      night_schedule_enabled: false,
+      night_schedule_time: '19:00',
       charge_business_enabled: true,
       charge_iptv_enabled: true,
       charge_loans_enabled: true,
@@ -2737,17 +2750,14 @@ class DataStore {
       // corrige imediatamente para sua instância isolada única e reseta o status para 'disconnected'.
       const isMasterAdminTenant =
         tenantId === '2caa686e-9c14-439b-8e9d-9b25cfbac345' ||
-        tenant?.email?.toLowerCase().trim() === 'betaof10@hotmail.com';
+        tenant?.email?.toLowerCase().trim() === 'betaof10@hotmail.com' ||
+        tenant?.email?.toLowerCase().trim() === 'jonjontelaspremium@gmail.com';
 
       if (
         !isMasterAdminTenant &&
-        (!existing.instance_name ||
-          existing.instance_name === 'instancia_ativacoes_e_vendas' ||
-          existing.instance_name === 'instancia_cobrefacil_master_corporation' ||
-          existing.instance_name.includes('ativa') ||
-          existing.instance_name.startsWith('instancia_') ||
-          existing.connected_phone?.includes('219899850026') ||
-          existing.connected_phone?.includes('21989850026'))
+        (existing.instance_name === 'instancia_cobrefacil_master_corporation' ||
+          (existing.instance_name === 'instancia_ativacoes_e_vendas' && !existing.connected_phone) ||
+          existing.connected_phone?.includes('219899850026'))
       ) {
         existing.instance_name = properInstanceName;
         existing.status = 'disconnected';
@@ -2768,6 +2778,12 @@ class DataStore {
         overdue_days_limit: existing.overdue_days_limit ?? defaultConf.overdue_days_limit,
         second_scheduled_time_enabled: existing.second_scheduled_time_enabled ?? defaultConf.second_scheduled_time_enabled,
         second_scheduled_time: existing.second_scheduled_time || defaultConf.second_scheduled_time,
+        morning_schedule_enabled: existing.morning_schedule_enabled !== undefined ? existing.morning_schedule_enabled : true,
+        morning_schedule_time: existing.morning_schedule_time || existing.scheduled_time || '09:00',
+        afternoon_schedule_enabled: existing.afternoon_schedule_enabled !== undefined ? existing.afternoon_schedule_enabled : Boolean(existing.second_scheduled_time_enabled),
+        afternoon_schedule_time: existing.afternoon_schedule_time || existing.second_scheduled_time || '14:30',
+        night_schedule_enabled: existing.night_schedule_enabled !== undefined ? existing.night_schedule_enabled : false,
+        night_schedule_time: existing.night_schedule_time || '19:00',
         charge_business_enabled: existing.charge_business_enabled !== false,
         charge_iptv_enabled: existing.charge_iptv_enabled !== false,
         charge_loans_enabled: existing.charge_loans_enabled !== false,
@@ -2781,10 +2797,22 @@ class DataStore {
   public saveWhatsAppConfig(tenantId: string, config: WhatsAppAutomationConfig): WhatsAppAutomationConfig {
     const diskConfigs = this.loadObjectFile<Record<string, WhatsAppAutomationConfig>>(FILE_WHATSAPP_CONFIGS) || {};
     const oldConfig = diskConfigs[tenantId];
-    if (oldConfig && (oldConfig.scheduled_time !== config.scheduled_time || oldConfig.second_scheduled_time !== config.second_scheduled_time)) {
-      delete (config as any).last_run_schedule;
-      delete (config as any).last_run_schedule_second;
-      // Ao alterar o horário programado (ex: em teste ou reagendamento), remove os registros de envio automático de hoje para permitir que o novo horário realize o disparo
+    const morningChanged = oldConfig && (oldConfig.morning_schedule_time !== config.morning_schedule_time || oldConfig.scheduled_time !== config.scheduled_time || oldConfig.morning_schedule_enabled !== config.morning_schedule_enabled);
+    const afternoonChanged = oldConfig && (oldConfig.afternoon_schedule_time !== config.afternoon_schedule_time || oldConfig.second_scheduled_time !== config.second_scheduled_time || oldConfig.afternoon_schedule_enabled !== config.afternoon_schedule_enabled);
+    const nightChanged = oldConfig && (oldConfig.night_schedule_time !== config.night_schedule_time || oldConfig.night_schedule_enabled !== config.night_schedule_enabled);
+
+    if (morningChanged || afternoonChanged || nightChanged) {
+      if (morningChanged) {
+        delete (config as any).last_run_morning;
+        delete (config as any).last_run_schedule;
+      }
+      if (afternoonChanged) {
+        delete (config as any).last_run_afternoon;
+        delete (config as any).last_run_schedule_second;
+      }
+      if (nightChanged) {
+        delete (config as any).last_run_night;
+      }
       const todayStr = new Intl.DateTimeFormat('sv-SE', { timeZone: 'America/Sao_Paulo' }).format(new Date());
       this.whatsappDispatchLogs = (this.whatsappDispatchLogs || []).filter((l) => {
         if (l.tenant_id !== tenantId) return true;
@@ -2792,6 +2820,15 @@ class DataStore {
         return logDate !== todayStr || l.type === 'manual_test';
       });
       this.saveFile(FILE_WHATSAPP_LOGS, this.whatsappDispatchLogs);
+    }
+
+    // Sincroniza scheduled_time padrão com o horário da manhã e segundo horário com o da tarde
+    if (config.morning_schedule_time) {
+      config.scheduled_time = config.morning_schedule_time;
+    }
+    if (config.afternoon_schedule_time) {
+      config.second_scheduled_time = config.afternoon_schedule_time;
+      config.second_scheduled_time_enabled = Boolean(config.afternoon_schedule_enabled);
     }
 
     // Garante nome da instância se não fornecido
@@ -2889,35 +2926,72 @@ class DataStore {
       noticeType: string,
       dueDate: string,
       prodDesc?: string,
-      customerName?: string
+      customerName?: string,
+      referenceId?: string,
+      source?: string
     ) => {
       if (ignoreAlreadySent) return false;
       const cleanPhone = phone.replace(/\D/g, '');
-      const cleanCust = (customerName || '').trim().toLowerCase();
-      const cleanProd = (prodDesc || '').trim().toLowerCase();
+      if (!cleanPhone) return false;
 
-      return this.whatsappDispatchLogs.some((l) => {
+      return (this.whatsappDispatchLogs || []).some((l) => {
         if (l.tenant_id !== tenantId) return false;
         if (l.phone?.replace(/\D/g, '') !== cleanPhone) return false;
         if (l.type !== noticeType) return false;
         if (l.status !== 'sent') return false;
 
-        // Se tiver nome do cliente, diferencia cadastros com o mesmo telefone (ex: testes)
-        if (cleanCust && l.customer_name) {
-          const logCust = l.customer_name.trim().toLowerCase();
-          if (logCust !== cleanCust) return false;
+        const logDate = (l.timestamp || '').slice(0, 10);
+        // Só considera logs de hoje para evitar reenvio no mesmo dia
+        if (logDate !== todayStr) {
+          return false;
         }
 
-        const logDate = (l.timestamp || '').slice(0, 10);
-        if (noticeType === 'due_today' && logDate === todayStr) return true;
-        if (noticeType === 'due_tomorrow' && logDate === todayStr) return true;
-        if (noticeType === 'overdue' && (logDate === todayStr || logDate === yesterdayStr)) return true;
+        // Se tiver o mesmo ID de fatura/parcela/assinatura, já foi enviado
+        if (referenceId && (l as any).reference_id && (l as any).reference_id === referenceId) {
+          return true;
+        }
+
+        // Se for do mesmo cliente e do mesmo módulo/produto, já foi enviado hoje
+        const cleanCust = (customerName || '').toLowerCase().trim();
+        const logCust = (l.customer_name || '').toLowerCase().trim();
+        const cleanProd = (prodDesc || '').toLowerCase().trim();
+        const logProd = ((l as any).product || '').toLowerCase().trim();
+
+        const sameCust = cleanCust && logCust && (cleanCust === logCust || cleanCust.includes(logCust) || logCust.includes(cleanCust));
+        const sameProd = cleanProd && logProd && (cleanProd === logProd || cleanProd.includes(logProd) || logProd.includes(cleanProd));
+
+        if (sameCust && sameProd) {
+          return true;
+        }
+
+        if (sameCust && !logProd && !cleanProd) {
+          return true;
+        }
+
         return false;
       });
     };
 
     const config = this.getWhatsAppConfig(tenantId);
     const tenant = this.getTenant(tenantId) || this.tenants[0];
+
+    const overdueLimitDays = Number(config.overdue_days_limit) || 30;
+    const minOverdueDate = new Intl.DateTimeFormat('sv-SE', { timeZone: 'America/Sao_Paulo' }).format(
+      new Date(now.getTime() - overdueLimitDays * 86400000)
+    );
+
+    // Isolamento estrito de tenant: não mesclar clientes de outros tenants
+    const matchesTenant = (itemTenantId?: string) => {
+      if (!itemTenantId) return false;
+      if (itemTenantId === tenantId) return true;
+      if (
+        (tenantId === '2caa686e-9c14-439b-8e9d-9b25cfbac345' && itemTenantId === 'tenant-master-admin') ||
+        (tenantId === 'tenant-master-admin' && itemTenantId === '2caa686e-9c14-439b-8e9d-9b25cfbac345')
+      ) {
+        return true;
+      }
+      return false;
+    };
 
     const formatBRLDate = (isoStr: string) => {
       try {
@@ -2965,6 +3039,65 @@ class DataStore {
       preview_message: string;
     }> = [];
 
+    // Chaves de controle para garantir que nenhum cliente/fatura seja inserido 2 vezes na mesma fila
+    const queuedNoticeKeys = new Set<string>();
+    const queuedCustomerIds = new Set<string>();
+
+    const pushNotice = (
+      list: 'today' | 'tomorrow' | 'overdue',
+      item: {
+        id: string;
+        source: 'charge' | 'subscription' | 'iptv' | 'loan';
+        type: 'due_today' | 'due_tomorrow' | 'overdue';
+        customer_name: string;
+        phone: string;
+        product: string;
+        amount: number;
+        due_date: string;
+        preview_message: string;
+      },
+      customerId?: string
+    ) => {
+      const cleanPhone = (item.phone || '').replace(/\D/g, '');
+      if (!cleanPhone) return;
+
+      // 1. Evita inserir o mesmo registro exato
+      const uniqueItemIdKey = `${item.source}_${item.id}_${item.type}`;
+      if (queuedNoticeKeys.has(uniqueItemIdKey)) {
+        return;
+      }
+
+      // 2. Evita duplicidade no mesmo módulo para o mesmo telefone e vencimento
+      // (ex: assinatura cadastrada como SubscriptionCustomer E SubscriptionSale para o mesmo cliente)
+      const phoneModuleTypeKey = `${item.source}_${cleanPhone}_${item.type}_${item.due_date}`;
+      if (queuedNoticeKeys.has(phoneModuleTypeKey)) {
+        return;
+      }
+
+      // 3. Deduplicação por cliente no mesmo módulo
+      if (customerId) {
+        const custKey = `${item.source}_${customerId}_${item.type}_${item.due_date}`;
+        if (queuedCustomerIds.has(custKey)) {
+          return;
+        }
+      }
+
+      // 4. Verifica se já foi disparado hoje no log histórico para este mesmo cliente/produto
+      if (wasNoticeAlreadySent(cleanPhone, item.type, item.due_date, item.product, item.customer_name, item.id, item.source)) {
+        return;
+      }
+
+      queuedNoticeKeys.add(uniqueItemIdKey);
+      queuedNoticeKeys.add(phoneModuleTypeKey);
+      if (customerId) {
+        queuedCustomerIds.add(`${item.source}_${customerId}_${item.type}_${item.due_date}`);
+      }
+
+      if (list === 'today') pendingToday.push(item as any);
+      else if (list === 'tomorrow') pendingTomorrow.push(item as any);
+      else pendingOverdue.push(item as any);
+    };
+
     // 1. Cobranças Normais (Negócios & Empresas)
     if (config.charge_business_enabled !== false) {
       const diskCharges = this.loadFile<Charge>(FILE_BUSINESS_SALES);
@@ -2997,7 +3130,7 @@ class DataStore {
       });
 
       const tenantCharges = this.charges.filter(
-        (c) => c.tenant_id === tenantId && c.status !== 'paid' && c.status !== 'cancelled'
+        (c) => matchesTenant(c.tenant_id) && c.status !== 'paid' && c.status !== 'cancelled'
       );
       for (const c of tenantCharges) {
         const cust = this.customers.find((cust) => cust.id === c.customer_id) || (c as any).customer;
@@ -3011,76 +3144,73 @@ class DataStore {
         const dueDate = (c.due_date || '').slice(0, 10);
         if (!dueDate) continue;
 
-        if (dueDate === todayStr && c.status !== 'overdue') {
-          if (!wasNoticeAlreadySent(phone, 'due_today', dueDate, prodName, custName)) {
-            pendingToday.push({
-              id: c.id,
-              source: 'charge',
-              type: 'due_today',
-              customer_name: custName,
-              phone,
-              product: prodName,
-              amount,
-              due_date: dueDate,
-              preview_message: renderCustomTemplate(config.template_today_message, {
-                cliente: custName,
-                primeiro_nome: String(custName).split(' ')[0],
-                produto: prodName,
-                valor: amount,
-                data_vencimento: formatBRLDate(dueDate),
-                chave_pix: tenant?.pix_key,
-                empresa: tenant?.trade_name || tenant?.name,
-                telefone: phone,
-              }),
-            });
-          }
+        const isOverdue =
+          (c.status === 'overdue' || (c.status !== 'paid' && dueDate < todayStr)) &&
+          dueDate >= minOverdueDate;
+
+        if (isOverdue) {
+          pushNotice('overdue', {
+            id: c.id,
+            source: 'charge',
+            type: 'overdue',
+            customer_name: custName,
+            phone,
+            product: prodName,
+            amount,
+            due_date: dueDate,
+            preview_message: renderCustomTemplate(config.template_overdue_message || '', {
+              cliente: custName,
+              primeiro_nome: String(custName).split(' ')[0],
+              produto: prodName,
+              valor: amount,
+              data_vencimento: formatBRLDate(dueDate),
+              chave_pix: tenant?.pix_key,
+              empresa: tenant?.trade_name || tenant?.name,
+              telefone: phone,
+            }),
+          }, c.customer_id);
+        } else if (dueDate === todayStr && c.status !== 'overdue') {
+          pushNotice('today', {
+            id: c.id,
+            source: 'charge',
+            type: 'due_today',
+            customer_name: custName,
+            phone,
+            product: prodName,
+            amount,
+            due_date: dueDate,
+            preview_message: renderCustomTemplate(config.template_today_message, {
+              cliente: custName,
+              primeiro_nome: String(custName).split(' ')[0],
+              produto: prodName,
+              valor: amount,
+              data_vencimento: formatBRLDate(dueDate),
+              chave_pix: tenant?.pix_key,
+              empresa: tenant?.trade_name || tenant?.name,
+              telefone: phone,
+            }),
+          }, c.customer_id);
         } else if (dueDate === tomorrowStr && c.status !== 'overdue') {
-          if (!wasNoticeAlreadySent(phone, 'due_tomorrow', dueDate, prodName, custName)) {
-            pendingTomorrow.push({
-              id: c.id,
-              source: 'charge',
-              type: 'due_tomorrow',
-              customer_name: custName,
-              phone,
-              product: prodName,
-              amount,
-              due_date: dueDate,
-              preview_message: renderCustomTemplate(config.template_tomorrow_message, {
-                cliente: custName,
-                primeiro_nome: String(custName).split(' ')[0],
-                produto: prodName,
-                valor: amount,
-                data_vencimento: formatBRLDate(dueDate),
-                chave_pix: tenant?.pix_key,
-                empresa: tenant?.trade_name || tenant?.name,
-                telefone: phone,
-              }),
-            });
-          }
-        } else if (dueDate === yesterdayStr && (c.status === 'overdue' || dueDate < todayStr)) {
-          // Dispara cobrança de atraso estritamente no dia seguinte ao vencimento (1 dia após) e apenas se ainda não foi cobrado
-          if (!wasNoticeAlreadySent(phone, 'overdue', dueDate, prodName, custName)) {
-            pendingOverdue.push({
-              id: c.id,
-              source: 'charge',
-              type: 'overdue',
-              customer_name: custName,
-              phone,
-              product: prodName,
-              amount,
-              due_date: dueDate,
-              preview_message: renderCustomTemplate(config.template_overdue_message || '', {
-                cliente: custName,
-                primeiro_nome: String(custName).split(' ')[0],
-                produto: prodName,
-                valor: amount,
-                data_vencimento: formatBRLDate(dueDate),
-                chave_pix: tenant?.pix_key,
-                empresa: tenant?.trade_name || tenant?.name,
-                telefone: phone,
-              }),
-            });
-          }
+          pushNotice('tomorrow', {
+            id: c.id,
+            source: 'charge',
+            type: 'due_tomorrow',
+            customer_name: custName,
+            phone,
+            product: prodName,
+            amount,
+            due_date: dueDate,
+            preview_message: renderCustomTemplate(config.template_tomorrow_message, {
+              cliente: custName,
+              primeiro_nome: String(custName).split(' ')[0],
+              produto: prodName,
+              valor: amount,
+              data_vencimento: formatBRLDate(dueDate),
+              chave_pix: tenant?.pix_key,
+              empresa: tenant?.trade_name || tenant?.name,
+              telefone: phone,
+            }),
+          }, c.customer_id);
         }
       }
     }
@@ -3092,176 +3222,189 @@ class DataStore {
         this.subscriptionCustomers = diskSubCusts;
       }
       const tenantSubs = this.subscriptionCustomers.filter(
-        (s) => s.tenant_id === tenantId && s.status !== 'cancelled' && (s.whatsapp || (s as any).phone)
+        (s) => matchesTenant(s.tenant_id) && s.status !== 'cancelled' && (s.whatsapp || (s as any).phone)
       );
 
       for (const s of tenantSubs) {
-        const dueDate = (s.next_due_date || s.start_date || '').slice(0, 10);
+        let nextDueDate = s.next_due_date;
+        let custPrice = s.price;
+        let custPlan = s.plan_name;
+        if (s.notes && typeof s.notes === 'string' && s.notes.trim().startsWith('{')) {
+          try {
+            const extra = JSON.parse(s.notes.trim());
+            if (!nextDueDate && extra.next_due_date) nextDueDate = extra.next_due_date;
+            if (!custPrice && extra.price !== undefined) custPrice = extra.price;
+            if (!custPlan && extra.plan_name) custPlan = extra.plan_name;
+          } catch {}
+        }
+        const dueDate = (nextDueDate || s.start_date || '').slice(0, 10);
         const phone = (s.whatsapp || (s as any).phone || '').replace(/\D/g, '');
         if (!dueDate || !phone) continue;
 
         const custName = s.customer_name || (s as any).name || 'Cliente';
-        const prodName = s.plan_name || 'Assinatura Mensal';
-        const amount = Number(s.price) || 0;
+        const prodName = custPlan || s.plan_name || 'Assinatura Mensal';
+        const amount = Number(custPrice !== undefined ? custPrice : s.price) || 0;
 
-        if (dueDate === todayStr && s.status !== 'overdue') {
-          if (!wasNoticeAlreadySent(phone, 'due_today', dueDate, prodName, custName)) {
-            pendingToday.push({
-              id: s.id,
-              source: 'subscription',
-              type: 'due_today',
-              customer_name: custName,
-              phone,
-              product: prodName,
-              amount,
-              due_date: dueDate,
-              preview_message: renderCustomTemplate(config.template_today_message, {
-                cliente: custName,
-                primeiro_nome: String(custName || 'Cliente').split(' ')[0],
-                produto: prodName,
-                valor: amount,
-                data_vencimento: formatBRLDate(dueDate),
-                chave_pix: tenant?.pix_key,
-                empresa: tenant?.trade_name || tenant?.name,
-                telefone: phone,
-              }),
-            });
-          }
-        } else if (dueDate === tomorrowStr && s.status !== 'overdue') {
-          if (!wasNoticeAlreadySent(phone, 'due_tomorrow', dueDate, prodName, custName)) {
-            pendingTomorrow.push({
-              id: s.id,
-              source: 'subscription',
-              type: 'due_tomorrow',
-              customer_name: custName,
-              phone,
-              product: prodName,
-              amount,
-              due_date: dueDate,
-              preview_message: renderCustomTemplate(config.template_tomorrow_message, {
-                cliente: custName,
-                primeiro_nome: String(custName || 'Cliente').split(' ')[0],
-                produto: prodName,
-                valor: amount,
-                data_vencimento: formatBRLDate(dueDate),
-                chave_pix: tenant?.pix_key,
-                empresa: tenant?.trade_name || tenant?.name,
-                telefone: phone,
-              }),
-            });
-          }
-        } else if (dueDate === yesterdayStr && (s.status === 'overdue' || dueDate < todayStr)) {
-          if (!wasNoticeAlreadySent(phone, 'overdue', dueDate, prodName, custName)) {
-            pendingOverdue.push({
-              id: s.id,
-              source: 'subscription',
-              type: 'overdue',
-              customer_name: custName,
-              phone,
-              product: prodName,
-              amount,
-              due_date: dueDate,
-              preview_message: renderCustomTemplate(config.template_overdue_message || '', {
-                cliente: custName,
-                primeiro_nome: String(custName || 'Cliente').split(' ')[0],
-                produto: prodName,
-                valor: amount,
-                data_vencimento: formatBRLDate(dueDate),
-                chave_pix: tenant?.pix_key,
-                empresa: tenant?.trade_name || tenant?.name,
-                telefone: phone,
-              }),
-            });
-          }
+        const isOverdue =
+          (s.status === 'overdue' || dueDate < todayStr) &&
+          dueDate >= minOverdueDate &&
+          s.status !== 'paid' &&
+          s.status !== 'cancelled';
+
+        if (isOverdue) {
+          pushNotice('overdue', {
+            id: s.id,
+            source: 'subscription',
+            type: 'overdue',
+            customer_name: custName,
+            phone,
+            product: prodName,
+            amount,
+            due_date: dueDate,
+            preview_message: renderCustomTemplate(config.template_overdue_message || '', {
+              cliente: custName,
+              primeiro_nome: String(custName || 'Cliente').split(' ')[0],
+              produto: prodName,
+              valor: amount,
+              data_vencimento: formatBRLDate(dueDate),
+              chave_pix: tenant?.pix_key,
+              empresa: tenant?.trade_name || tenant?.name,
+              telefone: phone,
+            }),
+          }, s.id);
+        } else if (dueDate === todayStr) {
+          pushNotice('today', {
+            id: s.id,
+            source: 'subscription',
+            type: 'due_today',
+            customer_name: custName,
+            phone,
+            product: prodName,
+            amount,
+            due_date: dueDate,
+            preview_message: renderCustomTemplate(config.template_today_message, {
+              cliente: custName,
+              primeiro_nome: String(custName || 'Cliente').split(' ')[0],
+              produto: prodName,
+              valor: amount,
+              data_vencimento: formatBRLDate(dueDate),
+              chave_pix: tenant?.pix_key,
+              empresa: tenant?.trade_name || tenant?.name,
+              telefone: phone,
+            }),
+          }, s.id);
+        } else if (dueDate === tomorrowStr) {
+          pushNotice('tomorrow', {
+            id: s.id,
+            source: 'subscription',
+            type: 'due_tomorrow',
+            customer_name: custName,
+            phone,
+            product: prodName,
+            amount,
+            due_date: dueDate,
+            preview_message: renderCustomTemplate(config.template_tomorrow_message, {
+              cliente: custName,
+              primeiro_nome: String(custName || 'Cliente').split(' ')[0],
+              produto: prodName,
+              valor: amount,
+              data_vencimento: formatBRLDate(dueDate),
+              chave_pix: tenant?.pix_key,
+              empresa: tenant?.trade_name || tenant?.name,
+              telefone: phone,
+            }),
+          }, s.id);
         }
       }
 
-      // Vendas de Assinatura (SubscriptionSale)
+      // Vendas de Assinatura (SubscriptionSale) - Adiciona somente se o assinante não foi inserido acima
       const diskSubSales = this.loadFile<SubscriptionSale>(FILE_SUBSCRIPTION_SALES);
       if (diskSubSales && Array.isArray(diskSubSales)) {
         this.subscriptionSales = diskSubSales;
       }
       const tenantSales = this.subscriptionSales.filter(
-        (sale) => sale.tenant_id === tenantId && sale.status !== 'paid' && sale.status !== 'cancelled'
+        (sale) => matchesTenant(sale.tenant_id) && sale.status !== 'paid' && sale.status !== 'cancelled'
       );
       for (const sale of tenantSales) {
         const dueDate = (sale.due_date || '').slice(0, 10);
-        const phone = (sale.whatsapp || '').replace(/\D/g, '');
+        const subCust = this.subscriptionCustomers.find((sc) => sc.id === sale.customer_id);
+        const rawPhone = sale.whatsapp || subCust?.whatsapp || (subCust as any)?.phone || '';
+        const phone = rawPhone.replace(/\D/g, '');
         if (!dueDate || !phone) continue;
 
-        const custName = sale.customer_name || 'Cliente';
-        const prodName = sale.plan_name || 'Venda de Assinatura';
-        const amount = Number(sale.amount) || 0;
+        const custName = sale.customer_name || subCust?.customer_name || (subCust as any)?.name || 'Cliente';
+        const prodName = sale.plan_name || subCust?.plan_name || 'Venda de Assinatura';
+        const amount = Number(sale.amount) || Number(subCust?.price) || 0;
 
-        if (dueDate === todayStr && sale.status !== 'overdue') {
-          if (!wasNoticeAlreadySent(phone, 'due_today', dueDate, prodName, custName)) {
-            pendingToday.push({
-              id: sale.id,
-              source: 'subscription',
-              type: 'due_today',
-              customer_name: custName,
-              phone,
-              product: prodName,
-              amount,
-              due_date: dueDate,
-              preview_message: renderCustomTemplate(config.template_today_message, {
-                cliente: custName,
-                primeiro_nome: String(custName || 'Cliente').split(' ')[0],
-                produto: prodName,
-                valor: amount,
-                data_vencimento: formatBRLDate(dueDate),
-                chave_pix: tenant?.pix_key,
-                empresa: tenant?.trade_name || tenant?.name,
-                telefone: phone,
-              }),
-            });
-          }
-        } else if (dueDate === tomorrowStr && sale.status !== 'overdue') {
-          if (!wasNoticeAlreadySent(phone, 'due_tomorrow', dueDate, prodName, custName)) {
-            pendingTomorrow.push({
-              id: sale.id,
-              source: 'subscription',
-              type: 'due_tomorrow',
-              customer_name: custName,
-              phone,
-              product: prodName,
-              amount,
-              due_date: dueDate,
-              preview_message: renderCustomTemplate(config.template_tomorrow_message, {
-                cliente: custName,
-                primeiro_nome: String(custName || 'Cliente').split(' ')[0],
-                produto: prodName,
-                valor: amount,
-                data_vencimento: formatBRLDate(dueDate),
-                chave_pix: tenant?.pix_key,
-                empresa: tenant?.trade_name || tenant?.name,
-                telefone: phone,
-              }),
-            });
-          }
-        } else if (dueDate === yesterdayStr && (sale.status === 'overdue' || dueDate < todayStr)) {
-          if (!wasNoticeAlreadySent(phone, 'overdue', dueDate, prodName, custName)) {
-            pendingOverdue.push({
-              id: sale.id,
-              source: 'subscription',
-              type: 'overdue',
-              customer_name: custName,
-              phone,
-              product: prodName,
-              amount,
-              due_date: dueDate,
-              preview_message: renderCustomTemplate(config.template_overdue_message || '', {
-                cliente: custName,
-                primeiro_nome: String(custName || 'Cliente').split(' ')[0],
-                produto: prodName,
-                valor: amount,
-                data_vencimento: formatBRLDate(dueDate),
-                chave_pix: tenant?.pix_key,
-                empresa: tenant?.trade_name || tenant?.name,
-                telefone: phone,
-              }),
-            });
-          }
+        const isSaleOverdue =
+          (sale.status === 'overdue' || dueDate < todayStr) &&
+          dueDate >= minOverdueDate &&
+          sale.status !== 'paid' &&
+          sale.status !== 'cancelled';
+
+        if (isSaleOverdue) {
+          pushNotice('overdue', {
+            id: sale.id,
+            source: 'subscription',
+            type: 'overdue',
+            customer_name: custName,
+            phone,
+            product: prodName,
+            amount,
+            due_date: dueDate,
+            preview_message: renderCustomTemplate(config.template_overdue_message || '', {
+              cliente: custName,
+              primeiro_nome: String(custName || 'Cliente').split(' ')[0],
+              produto: prodName,
+              valor: amount,
+              data_vencimento: formatBRLDate(dueDate),
+              chave_pix: tenant?.pix_key,
+              empresa: tenant?.trade_name || tenant?.name,
+              telefone: phone,
+            }),
+          }, subCust?.id || sale.customer_id);
+        } else if (dueDate === todayStr && sale.status !== 'paid' && sale.status !== 'cancelled') {
+          pushNotice('today', {
+            id: sale.id,
+            source: 'subscription',
+            type: 'due_today',
+            customer_name: custName,
+            phone,
+            product: prodName,
+            amount,
+            due_date: dueDate,
+            preview_message: renderCustomTemplate(config.template_today_message, {
+              cliente: custName,
+              primeiro_nome: String(custName || 'Cliente').split(' ')[0],
+              produto: prodName,
+              valor: amount,
+              data_vencimento: formatBRLDate(dueDate),
+              chave_pix: tenant?.pix_key,
+              empresa: tenant?.trade_name || tenant?.name,
+              telefone: phone,
+            }),
+          }, subCust?.id || sale.customer_id);
+        } else if (dueDate === tomorrowStr && sale.status !== 'paid' && sale.status !== 'cancelled') {
+          pushNotice('tomorrow', {
+            id: sale.id,
+            source: 'subscription',
+            type: 'due_tomorrow',
+            customer_name: custName,
+            phone,
+            product: prodName,
+            amount,
+            due_date: dueDate,
+            preview_message: renderCustomTemplate(config.template_tomorrow_message, {
+              cliente: custName,
+              primeiro_nome: String(custName || 'Cliente').split(' ')[0],
+              produto: prodName,
+              valor: amount,
+              data_vencimento: formatBRLDate(dueDate),
+              chave_pix: tenant?.pix_key,
+              empresa: tenant?.trade_name || tenant?.name,
+              telefone: phone,
+            }),
+          }, subCust?.id || sale.customer_id);
         }
       }
     }
@@ -3273,7 +3416,7 @@ class DataStore {
         this.iptvSubscribers = diskIptv;
       }
       const tenantIptv = this.iptvSubscribers.filter(
-        (sub) => sub.tenant_id === tenantId && (sub.whatsapp || (sub as any).phone)
+        (sub) => matchesTenant(sub.tenant_id) && (sub.whatsapp || (sub as any).phone)
       );
 
       for (const sub of tenantIptv) {
@@ -3285,75 +3428,73 @@ class DataStore {
         const prodName = sub.plan_name || 'Plano IPTV';
         const amount = Number(sub.price || (sub as any).value) || 0;
 
-        if (dueDate === todayStr && sub.status !== 'expired') {
-          if (!wasNoticeAlreadySent(phone, 'due_today', dueDate, prodName, custName)) {
-            pendingToday.push({
-              id: sub.id,
-              source: 'iptv',
-              type: 'due_today',
-              customer_name: custName,
-              phone,
-              product: prodName,
-              amount,
-              due_date: dueDate,
-              preview_message: renderCustomTemplate(config.template_today_message, {
-                cliente: custName,
-                primeiro_nome: String(custName || 'Cliente').split(' ')[0],
-                produto: prodName,
-                valor: amount,
-                data_vencimento: formatBRLDate(dueDate),
-                chave_pix: tenant?.pix_key,
-                empresa: tenant?.trade_name || tenant?.name,
-                telefone: phone,
-              }),
-            });
-          }
+        const isIptvOverdue =
+          (sub.status === 'expired' || (sub as any).status === 'overdue' || dueDate < todayStr) &&
+          dueDate >= minOverdueDate;
+
+        if (isIptvOverdue) {
+          pushNotice('overdue', {
+            id: sub.id,
+            source: 'iptv',
+            type: 'overdue',
+            customer_name: custName,
+            phone,
+            product: prodName,
+            amount,
+            due_date: dueDate,
+            preview_message: renderCustomTemplate(config.template_overdue_message || '', {
+              cliente: custName,
+              primeiro_nome: String(custName || 'Cliente').split(' ')[0],
+              produto: prodName,
+              valor: amount,
+              data_vencimento: formatBRLDate(dueDate),
+              chave_pix: tenant?.pix_key,
+              empresa: tenant?.trade_name || tenant?.name,
+              telefone: phone,
+            }),
+          }, sub.id);
+        } else if (dueDate === todayStr && sub.status !== 'expired') {
+          pushNotice('today', {
+            id: sub.id,
+            source: 'iptv',
+            type: 'due_today',
+            customer_name: custName,
+            phone,
+            product: prodName,
+            amount,
+            due_date: dueDate,
+            preview_message: renderCustomTemplate(config.template_today_message, {
+              cliente: custName,
+              primeiro_nome: String(custName || 'Cliente').split(' ')[0],
+              produto: prodName,
+              valor: amount,
+              data_vencimento: formatBRLDate(dueDate),
+              chave_pix: tenant?.pix_key,
+              empresa: tenant?.trade_name || tenant?.name,
+              telefone: phone,
+            }),
+          }, sub.id);
         } else if (dueDate === tomorrowStr && sub.status !== 'expired') {
-          if (!wasNoticeAlreadySent(phone, 'due_tomorrow', dueDate, prodName, custName)) {
-            pendingTomorrow.push({
-              id: sub.id,
-              source: 'iptv',
-              type: 'due_tomorrow',
-              customer_name: custName,
-              phone,
-              product: prodName,
-              amount,
-              due_date: dueDate,
-              preview_message: renderCustomTemplate(config.template_tomorrow_message, {
-                cliente: custName,
-                primeiro_nome: String(custName || 'Cliente').split(' ')[0],
-                produto: prodName,
-                valor: amount,
-                data_vencimento: formatBRLDate(dueDate),
-                chave_pix: tenant?.pix_key,
-                empresa: tenant?.trade_name || tenant?.name,
-                telefone: phone,
-              }),
-            });
-          }
-        } else if (dueDate === yesterdayStr && (sub.status === 'expired' || dueDate < todayStr)) {
-          if (!wasNoticeAlreadySent(phone, 'overdue', dueDate, prodName, custName)) {
-            pendingOverdue.push({
-              id: sub.id,
-              source: 'iptv',
-              type: 'overdue',
-              customer_name: custName,
-              phone,
-              product: prodName,
-              amount,
-              due_date: dueDate,
-              preview_message: renderCustomTemplate(config.template_overdue_message || '', {
-                cliente: custName,
-                primeiro_nome: String(custName || 'Cliente').split(' ')[0],
-                produto: prodName,
-                valor: amount,
-                data_vencimento: formatBRLDate(dueDate),
-                chave_pix: tenant?.pix_key,
-                empresa: tenant?.trade_name || tenant?.name,
-                telefone: phone,
-              }),
-            });
-          }
+          pushNotice('tomorrow', {
+            id: sub.id,
+            source: 'iptv',
+            type: 'due_tomorrow',
+            customer_name: custName,
+            phone,
+            product: prodName,
+            amount,
+            due_date: dueDate,
+            preview_message: renderCustomTemplate(config.template_tomorrow_message, {
+              cliente: custName,
+              primeiro_nome: String(custName || 'Cliente').split(' ')[0],
+              produto: prodName,
+              valor: amount,
+              data_vencimento: formatBRLDate(dueDate),
+              chave_pix: tenant?.pix_key,
+              empresa: tenant?.trade_name || tenant?.name,
+              telefone: phone,
+            }),
+          }, sub.id);
         }
       }
     }
@@ -3365,7 +3506,7 @@ class DataStore {
         this.loans = diskLoans;
       }
       const tenantLoans = this.loans.filter(
-        (l) => l.tenantId === tenantId && l.status !== 'completed'
+        (l) => matchesTenant(l.tenantId || (l as any).tenant_id) && l.status !== 'completed'
       );
 
       for (const l of tenantLoans) {
@@ -3381,75 +3522,74 @@ class DataStore {
             const instAmount = Number(inst.amount) || 0;
             const prodName = `${l.description || 'Empréstimo'} (Parcela ${inst.number})`;
 
-            if (instDueDate === todayStr) {
-              if (!wasNoticeAlreadySent(phone, 'due_today', instDueDate, prodName, custName)) {
-                pendingToday.push({
-                  id: `${l.id}-${inst.id}`,
-                  source: 'loan',
-                  type: 'due_today',
-                  customer_name: custName,
-                  phone,
-                  product: prodName,
-                  amount: instAmount,
-                  due_date: instDueDate,
-                  preview_message: renderCustomTemplate(config.template_today_message, {
-                    cliente: custName,
-                    primeiro_nome: String(custName || 'Cliente').split(' ')[0],
-                    produto: prodName,
-                    valor: instAmount,
-                    data_vencimento: formatBRLDate(instDueDate),
-                    chave_pix: tenant?.pix_key,
-                    empresa: tenant?.trade_name || tenant?.name,
-                    telefone: phone,
-                  }),
-                });
-              }
+            const isInstOverdue =
+              (inst.status === 'overdue' || instDueDate < todayStr) &&
+              instDueDate >= minOverdueDate &&
+              inst.status !== 'paid';
+
+            if (isInstOverdue) {
+              pushNotice('overdue', {
+                id: `${l.id}-${inst.id}`,
+                source: 'loan',
+                type: 'overdue',
+                customer_name: custName,
+                phone,
+                product: prodName,
+                amount: instAmount,
+                due_date: instDueDate,
+                preview_message: renderCustomTemplate(config.template_overdue_message || '', {
+                  cliente: custName,
+                  primeiro_nome: String(custName || 'Cliente').split(' ')[0],
+                  produto: prodName,
+                  valor: instAmount,
+                  data_vencimento: formatBRLDate(instDueDate),
+                  chave_pix: tenant?.pix_key,
+                  empresa: tenant?.trade_name || tenant?.name,
+                  telefone: phone,
+                }),
+              }, `${l.id}-${inst.id}`);
+            } else if (instDueDate === todayStr) {
+              pushNotice('today', {
+                id: `${l.id}-${inst.id}`,
+                source: 'loan',
+                type: 'due_today',
+                customer_name: custName,
+                phone,
+                product: prodName,
+                amount: instAmount,
+                due_date: instDueDate,
+                preview_message: renderCustomTemplate(config.template_today_message, {
+                  cliente: custName,
+                  primeiro_nome: String(custName || 'Cliente').split(' ')[0],
+                  produto: prodName,
+                  valor: instAmount,
+                  data_vencimento: formatBRLDate(instDueDate),
+                  chave_pix: tenant?.pix_key,
+                  empresa: tenant?.trade_name || tenant?.name,
+                  telefone: phone,
+                }),
+              }, `${l.id}-${inst.id}`);
             } else if (instDueDate === tomorrowStr) {
-              if (!wasNoticeAlreadySent(phone, 'due_tomorrow', instDueDate, prodName, custName)) {
-                pendingTomorrow.push({
-                  id: `${l.id}-${inst.id}`,
-                  source: 'loan',
-                  type: 'due_tomorrow',
-                  customer_name: custName,
-                  phone,
-                  product: prodName,
-                  amount: instAmount,
-                  due_date: instDueDate,
-                  preview_message: renderCustomTemplate(config.template_tomorrow_message, {
-                    cliente: custName,
-                    primeiro_nome: String(custName || 'Cliente').split(' ')[0],
-                    produto: prodName,
-                    valor: instAmount,
-                    data_vencimento: formatBRLDate(instDueDate),
-                    chave_pix: tenant?.pix_key,
-                    empresa: tenant?.trade_name || tenant?.name,
-                    telefone: phone,
-                  }),
-                });
-              }
-            } else if (instDueDate === yesterdayStr && (inst.status === 'overdue' || instDueDate < todayStr)) {
-              if (!wasNoticeAlreadySent(phone, 'overdue', instDueDate, prodName, custName)) {
-                pendingOverdue.push({
-                  id: `${l.id}-${inst.id}`,
-                  source: 'loan',
-                  type: 'overdue',
-                  customer_name: custName,
-                  phone,
-                  product: prodName,
-                  amount: instAmount,
-                  due_date: instDueDate,
-                  preview_message: renderCustomTemplate(config.template_overdue_message || '', {
-                    cliente: custName,
-                    primeiro_nome: String(custName || 'Cliente').split(' ')[0],
-                    produto: prodName,
-                    valor: instAmount,
-                    data_vencimento: formatBRLDate(instDueDate),
-                    chave_pix: tenant?.pix_key,
-                    empresa: tenant?.trade_name || tenant?.name,
-                    telefone: phone,
-                  }),
-                });
-              }
+              pushNotice('tomorrow', {
+                id: `${l.id}-${inst.id}`,
+                source: 'loan',
+                type: 'due_tomorrow',
+                customer_name: custName,
+                phone,
+                product: prodName,
+                amount: instAmount,
+                due_date: instDueDate,
+                preview_message: renderCustomTemplate(config.template_tomorrow_message, {
+                  cliente: custName,
+                  primeiro_nome: String(custName || 'Cliente').split(' ')[0],
+                  produto: prodName,
+                  valor: instAmount,
+                  data_vencimento: formatBRLDate(instDueDate),
+                  chave_pix: tenant?.pix_key,
+                  empresa: tenant?.trade_name || tenant?.name,
+                  telefone: phone,
+                }),
+              }, `${l.id}-${inst.id}`);
             }
           }
         } else {
@@ -3458,75 +3598,75 @@ class DataStore {
           const amount = Number(l.totalToReceive || l.principalAmount) || 0;
           const prodName = l.description || 'Contrato de Empréstimo';
 
-          if (dueDate === todayStr) {
-            if (!wasNoticeAlreadySent(phone, 'due_today', dueDate, prodName, custName)) {
-              pendingToday.push({
-                id: l.id,
-                source: 'loan',
-                type: 'due_today',
-                customer_name: custName,
-                phone,
-                product: prodName,
-                amount,
-                due_date: dueDate,
-                preview_message: renderCustomTemplate(config.template_today_message, {
-                  cliente: custName,
-                  primeiro_nome: String(custName || 'Cliente').split(' ')[0],
-                  produto: prodName,
-                  valor: amount,
-                  data_vencimento: formatBRLDate(dueDate),
-                  chave_pix: tenant?.pix_key,
-                  empresa: tenant?.trade_name || tenant?.name,
-                  telefone: phone,
-                }),
-              });
-            }
+          const isLoanOverdue =
+            (l.status === 'overdue' || dueDate < todayStr) &&
+            dueDate >= minOverdueDate &&
+            l.status !== 'completed' &&
+            l.status !== 'paid';
+
+          if (isLoanOverdue) {
+            pushNotice('overdue', {
+              id: l.id,
+              source: 'loan',
+              type: 'overdue',
+              customer_name: custName,
+              phone,
+              product: prodName,
+              amount,
+              due_date: dueDate,
+              preview_message: renderCustomTemplate(config.template_overdue_message || '', {
+                cliente: custName,
+                primeiro_nome: String(custName || 'Cliente').split(' ')[0],
+                produto: prodName,
+                valor: amount,
+                data_vencimento: formatBRLDate(dueDate),
+                chave_pix: tenant?.pix_key,
+                empresa: tenant?.trade_name || tenant?.name,
+                telefone: phone,
+              }),
+            }, l.id);
+          } else if (dueDate === todayStr) {
+            pushNotice('today', {
+              id: l.id,
+              source: 'loan',
+              type: 'due_today',
+              customer_name: custName,
+              phone,
+              product: prodName,
+              amount,
+              due_date: dueDate,
+              preview_message: renderCustomTemplate(config.template_today_message, {
+                cliente: custName,
+                primeiro_nome: String(custName || 'Cliente').split(' ')[0],
+                produto: prodName,
+                valor: amount,
+                data_vencimento: formatBRLDate(dueDate),
+                chave_pix: tenant?.pix_key,
+                empresa: tenant?.trade_name || tenant?.name,
+                telefone: phone,
+              }),
+            }, l.id);
           } else if (dueDate === tomorrowStr) {
-            if (!wasNoticeAlreadySent(phone, 'due_tomorrow', dueDate, prodName, custName)) {
-              pendingTomorrow.push({
-                id: l.id,
-                source: 'loan',
-                type: 'due_tomorrow',
-                customer_name: custName,
-                phone,
-                product: prodName,
-                amount,
-                due_date: dueDate,
-                preview_message: renderCustomTemplate(config.template_tomorrow_message, {
-                  cliente: custName,
-                  primeiro_nome: String(custName || 'Cliente').split(' ')[0],
-                  produto: prodName,
-                  valor: amount,
-                  data_vencimento: formatBRLDate(dueDate),
-                  chave_pix: tenant?.pix_key,
-                  empresa: tenant?.trade_name || tenant?.name,
-                  telefone: phone,
-                }),
-              });
-            }
-          } else if (dueDate === yesterdayStr && (l.status === 'overdue' || dueDate < todayStr)) {
-            if (!wasNoticeAlreadySent(phone, 'overdue', dueDate, prodName, custName)) {
-              pendingOverdue.push({
-                id: l.id,
-                source: 'loan',
-                type: 'overdue',
-                customer_name: custName,
-                phone,
-                product: prodName,
-                amount,
-                due_date: dueDate,
-                preview_message: renderCustomTemplate(config.template_overdue_message || '', {
-                  cliente: custName,
-                  primeiro_nome: String(custName || 'Cliente').split(' ')[0],
-                  produto: prodName,
-                  valor: amount,
-                  data_vencimento: formatBRLDate(dueDate),
-                  chave_pix: tenant?.pix_key,
-                  empresa: tenant?.trade_name || tenant?.name,
-                  telefone: phone,
-                }),
-              });
-            }
+            pushNotice('tomorrow', {
+              id: l.id,
+              source: 'loan',
+              type: 'due_tomorrow',
+              customer_name: custName,
+              phone,
+              product: prodName,
+              amount,
+              due_date: dueDate,
+              preview_message: renderCustomTemplate(config.template_tomorrow_message, {
+                cliente: custName,
+                primeiro_nome: String(custName || 'Cliente').split(' ')[0],
+                produto: prodName,
+                valor: amount,
+                data_vencimento: formatBRLDate(dueDate),
+                chave_pix: tenant?.pix_key,
+                empresa: tenant?.trade_name || tenant?.name,
+                telefone: phone,
+              }),
+            }, l.id);
           }
         }
       }
@@ -3543,86 +3683,166 @@ class DataStore {
     };
   }
 
-  public async runAutomatedDispatches(tenantId: string, force = false) {
+  public async runAutomatedDispatches(
+    tenantId: string,
+    force = false,
+    targetModule?: 'loan' | 'iptv' | 'charge' | 'subscription' | 'all',
+    testPhone?: string
+  ) {
     if (tenantId === 'tenant-default') {
       return { success: false, skipped: true, reason: 'Disparos automáticos desativados para conta de teste/demonstração.' };
     }
 
-    if (isSupabaseConfigured()) {
-      await this.loadFromSupabase().catch(() => {});
+    // Trava de concorrência por tenant: impede que dois ciclos do agendador disparem o mesmo cliente em paralelo
+    if (this.isDispatchingMap.get(tenantId)) {
+      console.warn(`[Auto WhatsApp Scheduler] Bloqueado disparo concorrente para tenant ${tenantId}.`);
+      return { success: false, skipped: true, reason: 'Um disparo de mensagens já está em andamento para este painel.' };
     }
+    this.isDispatchingMap.set(tenantId, true);
 
-    const config = this.getWhatsAppConfig(tenantId);
+    try {
+      if (isSupabaseConfigured()) {
+        await this.loadFromSupabase().catch(() => {});
+      }
 
-    if (!config.auto_send_enabled && !force) {
-      return { success: false, skipped: true, reason: 'Disparos automáticos desativados nas configurações.' };
-    }
+      const config = this.getWhatsAppConfig(tenantId);
+      const tenant = this.getTenant(tenantId) || this.tenants[0];
 
-    const dayOfWeek = new Date().getDay(); // 0 is Sunday, 6 is Saturday
-    const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
-    if (isWeekend && !config.send_on_weekends && !force) {
-      return { success: false, skipped: true, reason: 'Envio aos finais de semana desativado.' };
-    }
+      if (!config.auto_send_enabled && !force) {
+        return { success: false, skipped: true, reason: 'Disparos automáticos desativados nas configurações.' };
+      }
 
-    const { pendingToday, pendingTomorrow, pendingOverdue } = this.getPendingAutomationNotices(tenantId, force);
-    const noticesToDispatch = [];
+      const dayOfWeek = new Date().getDay(); // 0 is Sunday, 6 is Saturday
+      const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
+      if (isWeekend && !config.send_on_weekends && !force) {
+        return { success: false, skipped: true, reason: 'Envio aos finais de semana desativado.' };
+      }
 
-    if (config.template_today_enabled || force) {
-      noticesToDispatch.push(...pendingToday);
-    }
-    if (config.template_tomorrow_enabled || force) {
-      noticesToDispatch.push(...pendingTomorrow);
-    }
-    if (config.template_overdue_enabled || force) {
-      noticesToDispatch.push(...pendingOverdue);
-    }
+      const { pendingToday, pendingTomorrow, pendingOverdue } = this.getPendingAutomationNotices(tenantId, force);
+      let noticesToDispatch = [];
 
-    console.log(`[Auto WhatsApp Scheduler] Executing ${noticesToDispatch.length} notices for tenant ${tenantId}`);
-    const results: WhatsAppDispatchLog[] = [];
+      if (config.template_today_enabled || force) {
+        noticesToDispatch.push(...pendingToday);
+      }
+      if (config.template_tomorrow_enabled || force) {
+        noticesToDispatch.push(...pendingTomorrow);
+      }
+      if (config.template_overdue_enabled || force) {
+        noticesToDispatch.push(...pendingOverdue);
+      }
 
-    for (const item of noticesToDispatch) {
-      const sendRes = await sendDirectWhatsAppTextMessage({
-        phone: item.phone,
-        message: item.preview_message,
-        apiConfig: config,
-      });
+      // Filtra pelo módulo específico solicitado se fornecido
+      if (targetModule && targetModule !== 'all') {
+        noticesToDispatch = noticesToDispatch.filter((item) => item.source === targetModule);
+      }
 
-      const logItem: WhatsAppDispatchLog = {
-        id: `dispatch-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-        tenant_id: tenantId,
-        timestamp: new Date().toISOString(),
-        type: item.type,
-        customer_name: item.customer_name,
-        phone: item.phone,
-        amount: item.amount,
-        description: item.product,
-        status: sendRes.success ? 'sent' : 'fallback_wa',
-        method: sendRes.method,
-        details: sendRes.success ? 'Mensagem disparada com sucesso' : (sendRes as any).error,
-        wa_link: sendRes.waDirectUrl,
+      // Deduplicação estrita pré-disparo: evita duplicar o mesmo item/registro no mesmo lote
+      const dedupeNoticesMap = new Map<string, typeof noticesToDispatch[0]>();
+      for (const item of noticesToDispatch) {
+        const cleanPhone = (item.phone || '').replace(/\D/g, '');
+        if (!cleanPhone) continue;
+        const key = `${item.source}_${cleanPhone}_${item.type}_${item.due_date}_${item.id}`;
+        if (!dedupeNoticesMap.has(key)) {
+          dedupeNoticesMap.set(key, item);
+        }
+      }
+      noticesToDispatch = Array.from(dedupeNoticesMap.values());
+
+      // Se o usuário solicitou teste de um módulo específico e não há débitos reais no dia,
+      // gera um disparo de diagnóstico operacional para comprovar o funcionamento no WhatsApp
+      if (noticesToDispatch.length === 0 && targetModule && targetModule !== 'all') {
+        const moduleNames: Record<string, string> = {
+          loan: 'Empréstimos',
+          iptv: 'IPTV & Streaming',
+          charge: 'Negócios de Empresa',
+          subscription: 'Assinaturas',
+        };
+        const moduleProducts: Record<string, string> = {
+          loan: 'Empréstimo (Parcela 1/3)',
+          iptv: 'Plano IPTV Full HD',
+          charge: 'Venda / Serviço Empresarial',
+          subscription: 'Assinatura Mensal VIP',
+        };
+
+        const resolvedPhone = testPhone || config.connected_phone || tenant?.whatsapp || '';
+        if (resolvedPhone) {
+          const sampleNotice = {
+            id: `diagnostic-${targetModule}-${Date.now()}`,
+            source: targetModule,
+            type: 'due_today' as const,
+            customer_name: `Teste Diagnóstico (${moduleNames[targetModule]})`,
+            phone: resolvedPhone,
+            product: moduleProducts[targetModule] || 'Serviço',
+            amount: 50.0,
+            due_date: new Date().toISOString().slice(0, 10),
+            preview_message: `🧪 *Diagnóstico do Módulo ${moduleNames[targetModule]}*\n\nOlá! Este é um disparo de teste imediato da automação do módulo de *${moduleNames[targetModule]}*.\n\n✅ *Status:* Automação Ativa e Operacional\n📦 *Serviço:* ${moduleProducts[targetModule]}\n💰 *Valor:* R$ 50,00\n🔑 *Chave PIX:* ${tenant?.pix_key || '02922901793'}\n🏢 *Empresa:* ${tenant?.trade_name || tenant?.name}\n\nSe você recebeu este aviso, a automação do WhatsApp deste módulo está 100% pronta e conectada! 🚀`,
+          };
+          noticesToDispatch.push(sampleNotice);
+        }
+      }
+
+      console.log(`[Auto WhatsApp Scheduler] Executing ${noticesToDispatch.length} notices for tenant ${tenantId} (module: ${targetModule || 'all'})`);
+      const results: WhatsAppDispatchLog[] = [];
+      const dispatchedPhonesThisRun = new Set<string>();
+
+      for (const item of noticesToDispatch) {
+        const targetPhone = (testPhone || item.phone || '').replace(/\D/g, '');
+        if (!targetPhone) continue;
+
+        // Se já disparou para este telefone e módulo na execução corrente, não repete
+        const runKey = `${item.source}_${targetPhone}_${item.type}_${item.due_date}`;
+        if (!testPhone && dispatchedPhonesThisRun.has(runKey)) {
+          console.log(`[Auto WhatsApp Scheduler] Pulando envio duplicado no mesmo lote para ${runKey}`);
+          continue;
+        }
+        dispatchedPhonesThisRun.add(runKey);
+
+        const sendRes = await sendDirectWhatsAppTextMessage({
+          phone: targetPhone,
+          message: item.preview_message,
+          apiConfig: config,
+        });
+
+        const logItem: WhatsAppDispatchLog = {
+          id: `dispatch-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          tenant_id: tenantId,
+          timestamp: new Date().toISOString(),
+          type: item.type,
+          customer_name: item.customer_name,
+          phone: targetPhone,
+          amount: item.amount,
+          description: item.product,
+          status: sendRes.success ? 'sent' : 'fallback_wa',
+          method: sendRes.method,
+          details: sendRes.success ? 'Mensagem disparada com sucesso' : (sendRes as any).error,
+          wa_link: sendRes.waDirectUrl,
+        };
+
+        this.addWhatsAppDispatchLog(logItem);
+        results.push(logItem);
+
+        // Delay between dispatches (small wait so we don't bombard the gateway)
+        const waitMs = Math.min(Math.max((config.delay_seconds || 5) * 100, 200), 2000);
+        await new Promise((r) => setTimeout(r, waitMs));
+      }
+
+      // Update config metadata with last run
+      config.last_run_at = new Date().toISOString();
+      config.last_run_count = results.length;
+      config.last_run_status = results.length > 0 ? 'Concluído com sucesso' : 'Nenhuma fatura pendente hoje';
+      this.saveWhatsAppConfig(tenantId, config);
+
+      return {
+        success: true,
+        timestamp: config.last_run_at,
+        dispatchedCount: results.length,
+        dispatches: results,
+        message: `${results.length} mensagens processadas com sucesso!`,
+        targetModule: targetModule || 'all',
       };
-
-      this.addWhatsAppDispatchLog(logItem);
-      results.push(logItem);
-
-      // Delay between dispatches (small wait so we don't bombard the gateway)
-      const waitMs = Math.min(Math.max((config.delay_seconds || 5) * 100, 200), 2000);
-      await new Promise((r) => setTimeout(r, waitMs));
+    } finally {
+      this.isDispatchingMap.delete(tenantId);
     }
-
-    // Update config metadata with last run
-    config.last_run_at = new Date().toISOString();
-    config.last_run_count = results.length;
-    config.last_run_status = results.length > 0 ? 'Concluído com sucesso' : 'Nenhuma fatura pendente hoje';
-    this.saveWhatsAppConfig(tenantId, config);
-
-    return {
-      success: true,
-      timestamp: config.last_run_at,
-      dispatchedCount: results.length,
-      dispatches: results,
-      message: `${results.length} mensagens processadas com sucesso!`,
-    };
   }
 
   // IPTV Operations
@@ -3847,16 +4067,21 @@ class DataStore {
   }
 
   public deleteIPTVSubscriber(id: string): boolean {
+    const diskSubs = this.loadFile<IPTVSubscriber>(FILE_IPTV_SUBSCRIBERS);
+    if (diskSubs && Array.isArray(diskSubs)) {
+      this.iptvSubscribers = diskSubs;
+    }
     const initialLen = this.iptvSubscribers.length;
     this.iptvSubscribers = this.iptvSubscribers.filter((s) => s.id !== id);
     const deleted = this.iptvSubscribers.length < initialLen;
-    if (deleted) this.persist();
+    this.saveFile(FILE_IPTV_SUBSCRIBERS, this.iptvSubscribers);
+    this.persist();
     return deleted;
   }
 
   public async deleteIPTVSubscriberAsync(id: string): Promise<boolean> {
     const deleted = this.deleteIPTVSubscriber(id);
-    if (deleted && isSupabaseConfigured()) {
+    if (isSupabaseConfigured()) {
       try {
         const client = getSupabaseClient();
         if (client) {
@@ -4219,23 +4444,35 @@ class DataStore {
   }
 
   public deleteSubscriptionCustomer(id: string): boolean {
+    const diskSubs = this.loadFile<SubscriptionCustomer>(FILE_SUBSCRIPTION_CUSTOMERS);
+    if (diskSubs && Array.isArray(diskSubs)) {
+      this.subscriptionCustomers = diskSubs;
+    }
     const initialLen = this.subscriptionCustomers.length;
     this.subscriptionCustomers = this.subscriptionCustomers.filter((c) => c.id !== id);
-    const deleted = this.subscriptionCustomers.length < initialLen;
-    if (deleted) {
-      this.persist();
-      if (isSupabaseConfigured()) {
+    const diskSales = this.loadFile<SubscriptionSale>(FILE_SUBSCRIPTION_SALES);
+    if (diskSales && Array.isArray(diskSales)) {
+      this.subscriptionSales = diskSales;
+    }
+    this.subscriptionSales = this.subscriptionSales.filter((s) => s.customer_id !== id);
+    this.saveFile(FILE_SUBSCRIPTION_CUSTOMERS, this.subscriptionCustomers);
+    this.saveFile(FILE_SUBSCRIPTION_SALES, this.subscriptionSales);
+    this.persist();
+
+    if (isSupabaseConfigured()) {
+      (async () => {
         try {
           const client = getSupabaseClient();
           if (client) {
-            client.from('subscription_customers').delete().eq('id', id).then(() => {});
+            await client.from('subscription_sales').delete().eq('customer_id', id);
+            await client.from('subscription_customers').delete().eq('id', id);
           }
         } catch (err) {
           console.warn('[Direct Supabase Delete sub customer warn]', err);
         }
-      }
+      })();
     }
-    return deleted;
+    return this.subscriptionCustomers.length < initialLen;
   }
 
   // 2. Planos de Assinaturas

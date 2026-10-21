@@ -21,6 +21,7 @@ import {
   TrendingUp,
   CreditCard,
   Check,
+  Loader2,
 } from 'lucide-react';
 import {
   Tenant,
@@ -430,6 +431,8 @@ export const SubscriptionsView: React.FC<SubscriptionsViewProps> = ({
   // Search & Filter
   const [searchTerm, setSearchTerm] = useState('');
   const [copiedPixId, setCopiedPixId] = useState<string | null>(null);
+  const [sendingWhatsAppId, setSendingWhatsAppId] = useState<string | null>(null);
+  const [waToast, setWaToast] = useState<{ type: 'success' | 'error' | 'link'; message: string; url?: string } | null>(null);
 
   // Modals state
   const [isCustomerModalOpen, setIsCustomerModalOpen] = useState(false);
@@ -679,10 +682,14 @@ export const SubscriptionsView: React.FC<SubscriptionsViewProps> = ({
     setIsDeletingCustomer(true);
     try {
       if (isSupabaseConfigured && tenant?.id) {
-        await deleteSubscriptionCustomerFromSupabase(tenant.id, idToDelete);
-      } else {
-        await api.deleteSubscriptionCustomer(idToDelete);
+        try {
+          await deleteSubscriptionCustomerFromSupabase(tenant.id, idToDelete);
+        } catch (subErr) {
+          console.warn('[SubscriptionsView] Falha ao excluir do Supabase:', subErr);
+        }
       }
+      await api.deleteSubscriptionCustomer(idToDelete);
+
       setCustomers((prev) => {
         const next = prev.filter((c) => c.id !== idToDelete);
         try {
@@ -690,8 +697,13 @@ export const SubscriptionsView: React.FC<SubscriptionsViewProps> = ({
         } catch {}
         return next;
       });
-      // Sincronização secundária de compatibilidade Express
-      api.deleteSubscriptionCustomer(idToDelete).catch(() => {});
+      setSales((prev) => {
+        const next = prev.filter((s) => s.customer_id !== idToDelete);
+        try {
+          localStorage.setItem(`multigestor_sub_sales_${tenant.id}`, JSON.stringify(next));
+        } catch {}
+        return next;
+      });
       setCustomerToDelete(null);
     } catch (err: any) {
       console.error('[SubscriptionsView] Erro ao excluir assinante:', err);
@@ -1151,19 +1163,49 @@ export const SubscriptionsView: React.FC<SubscriptionsViewProps> = ({
 
   // WhatsApp Billing
   const handleSendWhatsApp = async (item: {
+    id?: string;
+    customer_id?: string;
+    customerId?: string;
     customer_name: string;
-    whatsapp: string;
+    whatsapp?: string;
+    phone?: string;
     plan_name: string;
     amount?: number;
     price?: number;
     due_date?: string;
     next_due_date?: string;
   }) => {
-    const phone = item.whatsapp.replace(/\D/g, '');
-    const cleanPhone = phone.length <= 11 ? `55${phone}` : phone;
+    // 1. Resolve o telefone: prioriza o campo direto ou busca o assinante na lista pelo id/nome
+    let rawPhone = item.whatsapp || item.phone || '';
+    if (!rawPhone) {
+      const foundCust = customers.find(
+        (c) =>
+          (item.customer_id && c.id === item.customer_id) ||
+          (item.customer_name &&
+            ((c.customer_name && c.customer_name.toLowerCase() === item.customer_name.toLowerCase()) ||
+              ((c as any).name && (c as any).name.toLowerCase() === item.customer_name.toLowerCase())))
+      );
+      if (foundCust?.whatsapp) {
+        rawPhone = foundCust.whatsapp;
+      }
+    }
+
+    const digits = rawPhone.replace(/\D/g, '');
+    if (!digits || digits.length < 8) {
+      setWaToast({
+        type: 'error',
+        message: `Telefone WhatsApp não encontrado para "${item.customer_name}". Edite o assinante e informe o WhatsApp com DDD.`,
+      });
+      setTimeout(() => setWaToast(null), 5000);
+      return;
+    }
+
+    const cleanPhone = digits.length <= 11 ? `55${digits}` : digits;
     const val = item.amount ?? item.price ?? 0;
     const due = item.due_date ?? item.next_due_date ?? '';
-    const formattedDue = due ? new Date(due + 'T12:00:00').toLocaleDateString('pt-BR') : 'a combinar';
+    const formattedDue = due
+      ? new Date(due.includes('T') ? due : due + 'T12:00:00').toLocaleDateString('pt-BR')
+      : 'a combinar';
     const pixKey = tenant.pix_key || 'dlinformatica3137@gmail.com';
     const merchantName = tenant.trade_name || tenant.name || 'Multi Gestor';
 
@@ -1178,6 +1220,9 @@ export const SubscriptionsView: React.FC<SubscriptionsViewProps> = ({
     const encoded = encodeURIComponent(text);
     const waUrl = `https://wa.me/${cleanPhone}?text=${encoded}`;
 
+    const sendId = item.id || item.customer_name;
+    setSendingWhatsAppId(sendId);
+
     try {
       const res = await api.sendDirectWhatsApp({
         tenantId: tenant.id,
@@ -1188,13 +1233,33 @@ export const SubscriptionsView: React.FC<SubscriptionsViewProps> = ({
       });
 
       if (res.success && (res.method === 'evolution_api' || (res as any).sentDirectly)) {
-        alert(`✅ Mensagem de assinatura enviada com sucesso para ${item.customer_name} direto pelo WhatsApp!`);
+        setWaToast({
+          type: 'success',
+          message: `✅ Mensagem enviada com sucesso para ${item.customer_name} direto pelo WhatsApp conectado!`,
+        });
+        setTimeout(() => setWaToast(null), 4000);
         return;
       }
 
-      window.open(waUrl, '_blank');
+      setWaToast({
+        type: 'link',
+        message: `Aparelho ainda não conectado via QR Code. Clique para enviar a ${item.customer_name}:`,
+        url: waUrl,
+      });
+      try {
+        window.open(waUrl, '_blank', 'noopener,noreferrer');
+      } catch {}
     } catch {
-      window.open(waUrl, '_blank');
+      setWaToast({
+        type: 'link',
+        message: `Clique para enviar via WhatsApp Web/App para ${item.customer_name}:`,
+        url: waUrl,
+      });
+      try {
+        window.open(waUrl, '_blank', 'noopener,noreferrer');
+      } catch {}
+    } finally {
+      setSendingWhatsAppId(null);
     }
   };
 

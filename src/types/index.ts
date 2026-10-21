@@ -268,6 +268,14 @@ export interface WhatsAppAutomationConfig {
   second_scheduled_time_enabled?: boolean;
   second_scheduled_time?: string; // Ex: "15:00"
 
+  // Períodos de Cobrança Diária: Manhã, Tarde e Noite
+  morning_schedule_enabled?: boolean;
+  morning_schedule_time?: string; // Ex: "09:00"
+  afternoon_schedule_enabled?: boolean;
+  afternoon_schedule_time?: string; // Ex: "14:30"
+  night_schedule_enabled?: boolean;
+  night_schedule_time?: string; // Ex: "19:00"
+
   // Regras de Módulos para Cobrança Automática
   charge_business_enabled?: boolean; // Negócios & Empresas (Cobranças/Vendas)
   charge_iptv_enabled?: boolean; // IPTV (Assinantes Expirados e a Vencer)

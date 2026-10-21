@@ -449,10 +449,23 @@ export const api = {
     return res.json();
   },
 
+  async requestWhatsAppPairingCode(params: {
+    instance_name: string;
+    phoneNumber: string;
+  }): Promise<{ success: boolean; code?: string; error?: string }> {
+    const res = await fetchWithRetry('/api/whatsapp/instance/pairing-code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    });
+    return res.json();
+  },
+
   async disconnectWhatsAppInstance(params: {
     server_url: string;
     api_key: string;
     instance_name: string;
+    tenantId?: string;
   }): Promise<{ success: boolean }> {
     const res = await fetchWithRetry('/api/whatsapp/instance/disconnect', {
       method: 'POST',
@@ -462,7 +475,10 @@ export const api = {
     return res.json();
   },
 
-  async getPendingAutomationNotices(tenantId: string): Promise<{
+  async getPendingAutomationNotices(
+    tenantId: string,
+    force = false
+  ): Promise<{
     todayDate: string;
     tomorrowDate: string;
     pendingToday: any[];
@@ -471,7 +487,7 @@ export const api = {
     totalPending: number;
     totalOverdue: number;
   }> {
-    const res = await fetchWithRetry(`/api/automation/pending?tenantId=${tenantId}`);
+    const res = await fetchWithRetry(`/api/automation/pending?tenantId=${tenantId}&force=${force}`);
     return res.json();
   },
 
@@ -482,18 +498,21 @@ export const api = {
 
   async runAutomatedDispatches(
     tenantId: string,
-    force = true
+    force = true,
+    module?: 'loan' | 'iptv' | 'charge' | 'subscription' | 'all',
+    testPhone?: string
   ): Promise<{
     success: boolean;
     timestamp: string;
     dispatchedCount: number;
     dispatches: WhatsAppDispatchLog[];
     message: string;
+    targetModule?: string;
   }> {
     const res = await fetchWithRetry('/api/automation/run', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tenantId, force }),
+      body: JSON.stringify({ tenantId, force, module, testPhone }),
     });
     return res.json();
   },

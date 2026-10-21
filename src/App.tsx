@@ -817,10 +817,17 @@ export default function App() {
   // Customer Actions
   const handleDeleteCustomer = async (customerId: string) => {
     try {
-      if (isSupabaseConfigured && tenant?.id) {
-        await deleteCustomerFromSupabase(tenant.id, customerId);
-        broadcastCustomerChange('delete', { id: customerId, tenantId: tenant.id });
+      if (isSupabaseConfigured) {
+        try {
+          await deleteCustomerFromSupabase(tenant?.id || '', customerId);
+          if (tenant?.id) {
+            broadcastCustomerChange('delete', { id: customerId, tenantId: tenant.id });
+          }
+        } catch (subErr) {
+          console.warn('[handleDeleteCustomer] Aviso ao deletar no Supabase:', subErr);
+        }
       }
+      await api.deleteCustomer(customerId).catch(() => {});
       setCustomers((prev) => {
         const next = prev.filter((c) => c.id !== customerId);
         if (tenant?.id) {
@@ -830,7 +837,6 @@ export default function App() {
         }
         return next;
       });
-      api.deleteCustomer(customerId).catch(() => {});
       await refreshData();
     } catch (err) {
       console.error('Failed to delete customer', err);

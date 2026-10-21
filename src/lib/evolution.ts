@@ -471,13 +471,13 @@ export async function disconnectEvolutionInstance({
 }: {
   server_url?: string;
   api_key?: string;
-  instance_name: string;
+  instance_name?: string;
 }) {
   // Desconecta do Baileys nativo
   await disconnectBaileysInstance(instance_name).catch(() => {});
 
   // Desconecta da API externa se configurada
-  if (isExternalEvolutionUrl(server_url) && api_key) {
+  if (isExternalEvolutionUrl(server_url) && api_key && instance_name) {
     try {
       const url = server_url!.replace(/\/$/, '');
       const endpoint = `${url}/instance/logout/${instance_name}`;

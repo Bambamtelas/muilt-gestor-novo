@@ -155,21 +155,26 @@ export async function updateCustomerInSupabase(
 }
 
 /**
- * Exclui um cliente no Supabase PostgreSQL garantindo id AND tenant_id
+ * Exclui um cliente no Supabase PostgreSQL garantindo remoção definitiva
  */
 export async function deleteCustomerFromSupabase(
   tenantId: string,
   customerId: string
 ): Promise<boolean> {
-  if (!isSupabaseConfigured || !tenantId) {
+  if (!isSupabaseConfigured) {
     throw new Error('Supabase não está configurado.');
   }
 
+  // 1. Remove cobranças vinculadas ao cliente para evitar violações de chave estrangeira
+  try {
+    await supabase.from('charges').delete().eq('customer_id', customerId);
+  } catch {}
+
+  // 2. Exclui o cliente pela chave primária (id)
   const { error } = await supabase
     .from('customers')
     .delete()
-    .eq('id', customerId)
-    .eq('tenant_id', tenantId);
+    .eq('id', customerId);
 
   if (error) {
     throw new Error(`Não foi possível excluir o cliente do servidor: ${error.message}`);

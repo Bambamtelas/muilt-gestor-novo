@@ -40,6 +40,7 @@ import { MercadoPagoModal } from './MercadoPagoModal.js';
 import { ExternalLinkModal } from './ExternalLinkModal.js';
 import { ChangeMasterPasswordModal } from './ChangeMasterPasswordModal.js';
 import { SupportWhatsAppModal } from './SupportWhatsAppModal.js';
+import { ModuleAutomationDiagnostic } from './ModuleAutomationDiagnostic.js';
 
 interface MasterAdminViewProps {
   onTenantUpdated?: () => void;
@@ -598,7 +599,22 @@ export const MasterAdminView: React.FC<MasterAdminViewProps> = ({ onTenantUpdate
         </div>
       )}
 
-      {/* 2. Painel de Configuração de Valores dos Planos (Admin Master) */}
+      {/* 2. Centro de Diagnóstico e Teste de Automação (4 Módulos) */}
+      {(() => {
+        const masterTenant =
+          tenants.find(
+            (t) =>
+              t.id === '2caa686e-9c14-439b-8e9d-9b25cfbac345' ||
+              t.email?.toLowerCase().includes('betao') ||
+              t.email?.toLowerCase().includes('jonjon')
+          ) || tenants[0];
+
+        return masterTenant ? (
+          <ModuleAutomationDiagnostic tenant={masterTenant} onRefreshParent={fetchAdminData} />
+        ) : null;
+      })()}
+
+      {/* 3. Painel de Configuração de Valores dos Planos (Admin Master) */}
       <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-sm space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-800">
           <div>

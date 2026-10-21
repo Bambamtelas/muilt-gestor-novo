@@ -16,7 +16,7 @@ import {
 } from './lib/evolution.js';
 import { calculatePlanPrice, AppModule } from './types/index.js';
 import { testSupabaseConnection, isSupabaseConfigured, getSupabaseClient, SUPABASE_SCHEMA_SQL } from './lib/supabase.js';
-import { initAllSavedBaileysSessions, syncSessionFilesToSupabase } from './lib/baileysManager.js';
+import { initAllSavedBaileysSessions, syncSessionFilesToSupabase, requestBaileysPairingCode } from './lib/baileysManager.js';
 
 dotenv.config();
 
@@ -1162,15 +1162,55 @@ export function createApiApp(): Express {
     }
   });
 
-  // 9.5 Desconectar Instância da Evolution API
+  // 9.4.2 Obter Código de Emparelhamento Numérico (Pairing Code de 8 dígitos)
+  app.post('/api/whatsapp/instance/pairing-code', async (req: Request, res: Response) => {
+    try {
+      const { instance_name, phoneNumber, phone } = req.body;
+      const targetPhone = phoneNumber || phone;
+      const targetInstance = instance_name || 'instancia_ativacoes_e_vendas';
+      const result = await requestBaileysPairingCode({
+        instanceName: targetInstance,
+        phoneNumber: targetPhone,
+      });
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Failed to request pairing code' });
+    }
+  });
+
+  // 9.5 Desconectar Instância da Evolution API / Baileys
   app.post('/api/whatsapp/instance/disconnect', async (req: Request, res: Response) => {
     try {
-      const { server_url, api_key, instance_name } = req.body;
+      const { server_url, api_key, instance_name, tenantId } = req.body;
       const result = await disconnectEvolutionInstance({
         server_url,
         api_key,
         instance_name,
       });
+
+      // Atualiza imediatamente o status de configuração no banco de dados para o tenant
+      const targetTenantId = tenantId || (store.tenants[0]?.id) || '2caa686e-9c14-439b-8e9d-9b25cfbac345';
+      if (targetTenantId) {
+        const config = store.getWhatsAppConfig(targetTenantId);
+        if (config) {
+          config.status = 'disconnected';
+          config.connected_phone = '';
+          delete config.connected_at;
+          store.saveWhatsAppConfig(targetTenantId, config);
+        }
+      }
+
+      // Sincroniza qualquer outro tenant caso estivesse vinculado
+      for (const t of store.tenants) {
+        const c = store.getWhatsAppConfig(t.id);
+        if (c && c.status === 'connected' && (!instance_name || c.instance_name === instance_name)) {
+          c.status = 'disconnected';
+          c.connected_phone = '';
+          delete c.connected_at;
+          store.saveWhatsAppConfig(t.id, c);
+        }
+      }
+
       res.json(result);
     } catch (err: any) {
       res.status(500).json({ error: err?.message || 'Failed to disconnect' });
@@ -1227,12 +1267,12 @@ export function createApiApp(): Express {
   // 9.8 Executar Disparos Automáticos Imediatamente (Botão Disparar Agora / Manual Run)
   app.post('/api/automation/run', async (req: Request, res: Response) => {
     try {
-      const { tenantId, force = true } = req.body;
+      const { tenantId, force = true, module: targetModule, testPhone } = req.body;
       const targetTenantId = tenantId || store.tenants[0]?.id;
       if (!targetTenantId) {
         return res.status(400).json({ error: 'tenantId is required' });
       }
-      const runResult = await store.runAutomatedDispatches(targetTenantId, force);
+      const runResult = await store.runAutomatedDispatches(targetTenantId, force, targetModule, testPhone);
       res.json(runResult);
     } catch (err: any) {
       console.error('Error running automated dispatches:', err);
@@ -1725,6 +1765,8 @@ function startWhatsAppAutomationScheduler() {
     console.warn('[WhatsApp Scheduler] Aviso ao restaurar sessões salvas do WhatsApp:', err?.message);
   });
 
+  const activeSchedulerDispatches = new Set<string>();
+
   setInterval(async () => {
     try {
       const now = new Date();
@@ -1754,44 +1796,86 @@ function startWhatsAppAutomationScheduler() {
         const config = store.getWhatsAppConfig(tenantId);
         if (!config || !config.auto_send_enabled) continue;
 
-        // 1º Horário agendado
-        const scheduledTime = config.scheduled_time || '09:00';
-        const currentScheduleKey = `${todayIso}_T1_${scheduledTime}`;
-        const lastRunScheduleKey = (config as any).last_run_schedule || '';
-
-        // Dispara se o horário atual de Brasília atingiu ou passou o horário agendado
-        // E ainda não foi disparado para esta data e horário configurados:
-        if (brTime >= scheduledTime && lastRunScheduleKey !== currentScheduleKey) {
-          console.log(`[WhatsApp Scheduler] 1º Horário programado atingido (${scheduledTime} / atual: ${brTime}). Disparando avisos para ${tenant.name} (${tenantId}) em segundo plano.`);
-          try {
-            const dispatchResult = await store.runAutomatedDispatches(tenantId, false);
-            console.log(`[WhatsApp Scheduler] 1º Horário concluído para ${tenant.name}:`, dispatchResult?.message || 'OK');
-            (config as any).last_run_schedule = currentScheduleKey;
-            config.last_run_at = new Date().toISOString();
-            store.saveWhatsAppConfig(tenantId, config);
-          } catch (dispatchErr) {
-            console.error(`[WhatsApp Scheduler] Erro ao disparar avisos do 1º horário para ${tenantId}:`, dispatchErr);
-          }
+        // Se este tenant já estiver em meio a um disparo em andamento, pula para evitar duplicidades
+        if (activeSchedulerDispatches.has(tenantId)) {
+          continue;
         }
 
-        // 2º Horário agendado (Turno da Tarde / Repescagem de Inadimplentes)
-        if (config.second_scheduled_time_enabled && config.second_scheduled_time) {
-          const secondScheduledTime = config.second_scheduled_time;
-          const currentSecondScheduleKey = `${todayIso}_T2_${secondScheduledTime}`;
-          const lastRunScheduleKeySecond = (config as any).last_run_schedule_second || '';
+        // 1º Período Agendado: Manhã
+        const isMorningEnabled = config.morning_schedule_enabled !== false;
+        const morningTime = config.morning_schedule_time || config.scheduled_time || '09:00';
+        const currentMorningKey = `${todayIso}_MANHA_${morningTime}`;
+        const lastRunMorningKey = (config as any).last_run_morning || (config as any).last_run_schedule || '';
 
-          if (brTime >= secondScheduledTime && lastRunScheduleKeySecond !== currentSecondScheduleKey) {
-            console.log(`[WhatsApp Scheduler] 2º Horário (Repescagem) atingido (${secondScheduledTime} / atual: ${brTime}). Disparando avisos para ${tenant.name} (${tenant.id}) em segundo plano.`);
-            try {
-              const dispatchResult = await store.runAutomatedDispatches(tenant.id, false);
-              console.log(`[WhatsApp Scheduler] 2º Horário concluído para ${tenant.name}:`, dispatchResult?.message || 'OK');
-              (config as any).last_run_schedule_second = currentSecondScheduleKey;
-              config.last_run_at = new Date().toISOString();
-              store.saveWhatsAppConfig(tenant.id, config);
-            } catch (dispatchErr) {
-              console.error(`[WhatsApp Scheduler] Erro ao disparar avisos do 2º horário para ${tenant.id}:`, dispatchErr);
-            }
+        if (isMorningEnabled && brTime >= morningTime && lastRunMorningKey !== currentMorningKey) {
+          console.log(`[WhatsApp Scheduler] ☀️ Período da Manhã atingido (${morningTime} / atual: ${brTime}). Disparando avisos para ${tenant.name} (${tenantId}) em segundo plano.`);
+          // ATENÇÃO: Salva a chave IMEDIATAMENTE ANTES do disparo para blindar contra ticks sobrepostos a cada 30 segundos
+          (config as any).last_run_morning = currentMorningKey;
+          (config as any).last_run_schedule = currentMorningKey;
+          config.last_run_at = new Date().toISOString();
+          store.saveWhatsAppConfig(tenantId, config);
+
+          activeSchedulerDispatches.add(tenantId);
+          try {
+            const dispatchResult = await store.runAutomatedDispatches(tenantId, false);
+            console.log(`[WhatsApp Scheduler] ☀️ Manhã concluída para ${tenant.name}:`, dispatchResult?.message || 'OK');
+          } catch (dispatchErr) {
+            console.error(`[WhatsApp Scheduler] Erro ao disparar avisos da Manhã para ${tenantId}:`, dispatchErr);
+          } finally {
+            activeSchedulerDispatches.delete(tenantId);
           }
+          continue;
+        }
+
+        // 2º Período Agendado: Tarde
+        const isAfternoonEnabled = Boolean(config.afternoon_schedule_enabled || config.second_scheduled_time_enabled);
+        const afternoonTime = config.afternoon_schedule_time || config.second_scheduled_time || '14:30';
+        const currentAfternoonKey = `${todayIso}_TARDE_${afternoonTime}`;
+        const lastRunAfternoonKey = (config as any).last_run_afternoon || (config as any).last_run_schedule_second || '';
+
+        if (isAfternoonEnabled && brTime >= afternoonTime && lastRunAfternoonKey !== currentAfternoonKey) {
+          console.log(`[WhatsApp Scheduler] ⛅ Período da Tarde atingido (${afternoonTime} / atual: ${brTime}). Disparando avisos para ${tenant.name} (${tenantId}) em segundo plano.`);
+          // ATENÇÃO: Salva a chave IMEDIATAMENTE ANTES do disparo para blindar contra ticks sobrepostos a cada 30 segundos
+          (config as any).last_run_afternoon = currentAfternoonKey;
+          (config as any).last_run_schedule_second = currentAfternoonKey;
+          config.last_run_at = new Date().toISOString();
+          store.saveWhatsAppConfig(tenantId, config);
+
+          activeSchedulerDispatches.add(tenantId);
+          try {
+            const dispatchResult = await store.runAutomatedDispatches(tenantId, false);
+            console.log(`[WhatsApp Scheduler] ⛅ Tarde concluída para ${tenant.name}:`, dispatchResult?.message || 'OK');
+          } catch (dispatchErr) {
+            console.error(`[WhatsApp Scheduler] Erro ao disparar avisos da Tarde para ${tenantId}:`, dispatchErr);
+          } finally {
+            activeSchedulerDispatches.delete(tenantId);
+          }
+          continue;
+        }
+
+        // 3º Período Agendado: Noite
+        const isNightEnabled = Boolean(config.night_schedule_enabled);
+        const nightTime = config.night_schedule_time || '19:00';
+        const currentNightKey = `${todayIso}_NOITE_${nightTime}`;
+        const lastRunNightKey = (config as any).last_run_night || '';
+
+        if (isNightEnabled && brTime >= nightTime && lastRunNightKey !== currentNightKey) {
+          console.log(`[WhatsApp Scheduler] 🌙 Período da Noite atingido (${nightTime} / atual: ${brTime}). Disparando avisos para ${tenant.name} (${tenantId}) em segundo plano.`);
+          // ATENÇÃO: Salva a chave IMEDIATAMENTE ANTES do disparo para blindar contra ticks sobrepostos a cada 30 segundos
+          (config as any).last_run_night = currentNightKey;
+          config.last_run_at = new Date().toISOString();
+          store.saveWhatsAppConfig(tenantId, config);
+
+          activeSchedulerDispatches.add(tenantId);
+          try {
+            const dispatchResult = await store.runAutomatedDispatches(tenantId, false);
+            console.log(`[WhatsApp Scheduler] 🌙 Noite concluída para ${tenant.name}:`, dispatchResult?.message || 'OK');
+          } catch (dispatchErr) {
+            console.error(`[WhatsApp Scheduler] Erro ao disparar avisos da Noite para ${tenantId}:`, dispatchErr);
+          } finally {
+            activeSchedulerDispatches.delete(tenantId);
+          }
+          continue;
         }
       }
     } catch (err) {

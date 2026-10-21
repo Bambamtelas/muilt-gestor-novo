@@ -25,10 +25,15 @@ import {
   XCircle,
   ChevronDown,
   ChevronUp,
+  Sun,
+  CloudSun,
+  Moon,
+  Copy,
 } from 'lucide-react';
 import { Tenant, WhatsAppAutomationConfig, WhatsAppDispatchLog } from '../types/index.js';
 import { api } from '../lib/api.js';
 import QRCode from 'qrcode';
+import { ModuleAutomationDiagnostic } from './ModuleAutomationDiagnostic.js';
 
 interface WhatsAppAutomationViewProps {
   tenant: Tenant;
@@ -142,7 +147,8 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({ 
   const isMasterAdmin =
     tenant.id === '2caa686e-9c14-439b-8e9d-9b25cfbac345' ||
     tenant.email === 'betaof10@hotmail.com' ||
-    tenant.email === 'betoqueiroz@hotmail.com';
+    tenant.email === 'betoqueiroz@hotmail.com' ||
+    tenant.email === 'jonjontelaspremium@gmail.com';
 
   const [config, setConfig] = useState<WhatsAppAutomationConfig>(() => {
     try {
@@ -155,13 +161,9 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({ 
         // Garante isolamento estrito: contas de clientes entram desconectadas e nunca herdam instância do master
         if (!isMasterAdmin) {
           if (
-            !parsed.instance_name ||
             parsed.instance_name === 'instancia_cobrefacil_master_corporation' ||
-            parsed.instance_name === 'instancia_ativacoes_e_vendas' ||
-            parsed.instance_name.includes('ativa') ||
-            parsed.instance_name.startsWith('instancia_') ||
-            parsed.connected_phone?.includes('219899850026') ||
-            parsed.connected_phone?.includes('21989850026')
+            (parsed.instance_name === 'instancia_ativacoes_e_vendas' && !parsed.connected_phone) ||
+            parsed.connected_phone?.includes('219899850026')
           ) {
             parsed.instance_name = defaultInstanceName;
             parsed.status = 'disconnected';
@@ -179,6 +181,12 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({ 
         if (parsed.overdue_days_limit === undefined) parsed.overdue_days_limit = 30;
         if (parsed.second_scheduled_time_enabled === undefined) parsed.second_scheduled_time_enabled = false;
         if (!parsed.second_scheduled_time) parsed.second_scheduled_time = '14:30';
+        if (parsed.morning_schedule_enabled === undefined) parsed.morning_schedule_enabled = true;
+        if (!parsed.morning_schedule_time) parsed.morning_schedule_time = parsed.scheduled_time || '09:00';
+        if (parsed.afternoon_schedule_enabled === undefined) parsed.afternoon_schedule_enabled = Boolean(parsed.second_scheduled_time_enabled);
+        if (!parsed.afternoon_schedule_time) parsed.afternoon_schedule_time = parsed.second_scheduled_time || '14:30';
+        if (parsed.night_schedule_enabled === undefined) parsed.night_schedule_enabled = false;
+        if (!parsed.night_schedule_time) parsed.night_schedule_time = '19:00';
         if (parsed.charge_business_enabled === undefined) parsed.charge_business_enabled = true;
         if (parsed.charge_iptv_enabled === undefined) parsed.charge_iptv_enabled = true;
         if (parsed.charge_loans_enabled === undefined) parsed.charge_loans_enabled = true;
@@ -199,6 +207,12 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({ 
       scheduled_time: '09:00',
       second_scheduled_time_enabled: false,
       second_scheduled_time: '14:30',
+      morning_schedule_enabled: true,
+      morning_schedule_time: '09:00',
+      afternoon_schedule_enabled: false,
+      afternoon_schedule_time: '14:30',
+      night_schedule_enabled: false,
+      night_schedule_time: '19:00',
       send_on_weekends: true,
       delay_seconds: 25,
       charge_business_enabled: true,
@@ -218,8 +232,14 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({ 
   const [loadingConfig, setLoadingConfig] = useState(false);
   const [qrCodeDataUrl, setQrCodeDataUrl] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
-  const [countdown, setCountdown] = useState(60);
+  const [countdown, setCountdown] = useState(180);
   const [pairingStatusInfo, setPairingStatusInfo] = useState<string>('Gerando QR Code para conexão...');
+  const [pairingMode, setPairingMode] = useState<'qrcode' | 'pairing_code'>('qrcode');
+  const [pairingPhone, setPairingPhone] = useState(tenant.whatsapp || config.connected_phone || '21989850026');
+  const [pairingCodeValue, setPairingCodeValue] = useState<string | null>(null);
+  const [loadingPairingCode, setLoadingPairingCode] = useState(false);
+  const [pairingCodeCopied, setPairingCodeCopied] = useState(false);
+  const [pairingCodeError, setPairingCodeError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [savedSuccess, setSavedSuccess] = useState(false);
   const [connectionSuccessAlert, setConnectionSuccessAlert] = useState<string | null>(null);
@@ -295,6 +315,20 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({ 
     });
   };
 
+  // Atualiza múltiplos campos de configuração simultaneamente e persiste no storage e backend
+  const updateConfigFields = (patch: Partial<WhatsAppAutomationConfig>) => {
+    setConfig((prev) => {
+      const updated = { ...prev, ...patch };
+      try {
+        localStorage.setItem(storageKey, JSON.stringify(updated));
+      } catch (e) {
+        console.warn('Erro ao salvar no localStorage:', e);
+      }
+      api.saveWhatsAppConfig(tenant.id, updated).catch(() => {});
+      return updated;
+    });
+  };
+
   // Restaura mensagem padrão do modelo selecionado
   const handleRestoreTemplate = (templateKey: 'tomorrow' | 'today' | 'overdue') => {
     const defaultText =
@@ -324,13 +358,9 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({ 
       if (serverConfig && serverConfig.instance_name) {
         if (
           !isMasterAdmin &&
-          (!serverConfig.instance_name ||
-            serverConfig.instance_name === 'instancia_ativacoes_e_vendas' ||
-            serverConfig.instance_name === 'instancia_cobrefacil_master_corporation' ||
-            serverConfig.instance_name.includes('ativa') ||
-            serverConfig.instance_name.startsWith('instancia_') ||
-            serverConfig.connected_phone?.includes('219899850026') ||
-            serverConfig.connected_phone?.includes('21989850026'))
+          (serverConfig.instance_name === 'instancia_cobrefacil_master_corporation' ||
+            (serverConfig.instance_name === 'instancia_ativacoes_e_vendas' && !serverConfig.connected_phone) ||
+            serverConfig.connected_phone?.includes('219899850026'))
         ) {
           serverConfig.instance_name = defaultInstanceName;
           serverConfig.status = 'disconnected';
@@ -352,6 +382,10 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({ 
           api_key: serverConfig.api_key,
           instance_name: serverConfig.instance_name,
         }).then((liveRes) => {
+          // Se a instância estiver em processo de conexão ou reconexão automática, NÃO reseta o status para desconectada
+          if (liveRes?.state === 'connecting' || (liveRes as any)?.isReconnecting) {
+            return;
+          }
           const liveInst = (liveRes as any)?.actualInstanceName || (liveRes as any)?.instanceName;
           if (!isMasterAdmin && liveInst && (liveInst.includes('ativa') || liveInst.startsWith('instancia_'))) {
             return;
@@ -436,7 +470,7 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({ 
     let statusPoller: any;
 
     if (connecting) {
-      setCountdown(75);
+      setCountdown(180);
       setPairingStatusInfo('Inicializando sessão segura do WhatsApp e gerando QR Code oficial...');
       setQrCodeDataUrl(null);
 
@@ -455,9 +489,9 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({ 
             return;
           } else if (res?.code) {
             const url = await QRCode.toDataURL(res.code, {
-              margin: 2,
-              scale: 6,
-              color: { dark: '#0f172a', light: '#ffffff' },
+              margin: 3,
+              scale: 8,
+              color: { dark: '#000000', light: '#ffffff' },
             });
             setQrCodeDataUrl(url);
             setPairingStatusInfo('Aponte a câmera do WhatsApp para escanear');
@@ -476,9 +510,9 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({ 
             setPairingStatusInfo('Aponte a câmera do WhatsApp para escanear');
           } else if (connRes?.code) {
             const url = await QRCode.toDataURL(connRes.code, {
-              margin: 2,
-              scale: 6,
-              color: { dark: '#0f172a', light: '#ffffff' },
+              margin: 3,
+              scale: 8,
+              color: { dark: '#000000', light: '#ffffff' },
             });
             setQrCodeDataUrl(url);
             setPairingStatusInfo('Aponte a câmera do WhatsApp para escanear');
@@ -624,7 +658,7 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({ 
   };
 
   const handleRegenerateQR = () => {
-    setCountdown(75);
+    setCountdown(180);
     setQrCodeDataUrl(null);
     setPairingStatusInfo('Recriando sessão e gerando novo QR Code oficial...');
     api.createWhatsAppInstance({
@@ -638,9 +672,9 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({ 
           setPairingStatusInfo('Aponte a câmera do WhatsApp para escanear');
         } else if (res?.code) {
           QRCode.toDataURL(res.code, {
-            margin: 2,
-            scale: 6,
-            color: { dark: '#0f172a', light: '#ffffff' },
+            margin: 3,
+            scale: 8,
+            color: { dark: '#000000', light: '#ffffff' },
           }).then((url) => {
             setQrCodeDataUrl(url);
             setPairingStatusInfo('Aponte a câmera do WhatsApp para escanear');
@@ -652,6 +686,34 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({ 
       .catch((err) => {
         setPairingStatusInfo(`Erro ao regerar: ${err?.message || 'Falha ao obter QR'}`);
       });
+  };
+
+  const handleRequestPairingCode = async () => {
+    const raw = (pairingPhone || '').replace(/\D/g, '');
+    if (raw.length < 10) {
+      setPairingCodeError('Informe um número de WhatsApp com DDD (ex: 21989850026).');
+      return;
+    }
+    setLoadingPairingCode(true);
+    setPairingCodeError(null);
+    setPairingCodeValue(null);
+    setPairingStatusInfo('Solicitando código de emparelhamento de 8 dígitos ao WhatsApp...');
+    try {
+      const res = await api.requestWhatsAppPairingCode({
+        instance_name: config.instance_name || 'instancia_ativacoes_e_vendas',
+        phoneNumber: raw,
+      });
+      if (res.success && res.code) {
+        setPairingCodeValue(res.code);
+        setPairingStatusInfo(`Código gerado: ${res.code}. Digite este código no WhatsApp do celular agora!`);
+      } else {
+        setPairingCodeError(res.error || 'Falha ao gerar código no WhatsApp');
+      }
+    } catch (err: any) {
+      setPairingCodeError(err?.message || 'Erro ao comunicar com o servidor');
+    } finally {
+      setLoadingPairingCode(false);
+    }
   };
 
   const handleSimulateConnected = async () => {
@@ -699,24 +761,33 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({ 
 
   const handleDisconnect = async () => {
     if (confirm('Tem certeza que deseja desconectar a instância do WhatsApp? Os disparos automáticos serão pausados até nova conexão.')) {
+      setCheckingStatus(true);
       try {
         await api.disconnectWhatsAppInstance({
           server_url: config.server_url,
           api_key: config.api_key,
           instance_name: config.instance_name,
+          tenantId: tenant.id,
         });
-      } catch {}
+      } catch (err) {
+        console.warn('Erro ao chamar desconexão de instância:', err);
+      }
 
       const updated: WhatsAppAutomationConfig = {
         ...config,
         status: 'disconnected',
+        connected_phone: '',
         connected_at: undefined,
       };
       setConfig(updated);
       setConnecting(false);
       setQrCodeDataUrl(null);
-      localStorage.setItem(storageKey, JSON.stringify(updated));
-      api.saveWhatsAppConfig(tenant.id, updated).catch(() => {});
+      setPairingStatusInfo('');
+      try {
+        localStorage.setItem(storageKey, JSON.stringify(updated));
+      } catch {}
+      await api.saveWhatsAppConfig(tenant.id, updated).catch(() => {});
+      setCheckingStatus(false);
     }
   };
 
@@ -940,9 +1011,16 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({ 
                 </span>
               )}
               {config.auto_send_enabled && (
-                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-500/10 text-blue-400 border border-blue-500/20">
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-blue-500/10 text-blue-400 border border-blue-500/20">
                   <Clock className="w-3 h-3" />
-                  <span>Diário às {config.scheduled_time || '09:00'} (Brasília)</span>
+                  <span>
+                    Diário:{' '}
+                    {[
+                      config.morning_schedule_enabled !== false ? `☀️ ${config.morning_schedule_time || config.scheduled_time || '09:00'}` : null,
+                      (config.afternoon_schedule_enabled || config.second_scheduled_time_enabled) ? `⛅ ${config.afternoon_schedule_time || config.second_scheduled_time || '14:30'}` : null,
+                      config.night_schedule_enabled ? `🌙 ${config.night_schedule_time || '19:00'}` : null,
+                    ].filter(Boolean).join(' • ') || 'Nenhum turno ativo'}
+                  </span>
                 </span>
               )}
             </div>
@@ -983,10 +1061,11 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({ 
               <button
                 type="button"
                 onClick={handleDisconnect}
-                className="px-3 py-2 bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 border border-rose-500/30 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer"
+                disabled={checkingStatus}
+                className="px-3 py-2 bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 border border-rose-500/30 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
               >
                 <Power className="w-3.5 h-3.5" />
-                <span>Desconectar</span>
+                <span>{checkingStatus ? 'Desconectando...' : 'Desconectar'}</span>
               </button>
             </div>
           ) : (
@@ -1303,72 +1382,220 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({ 
             </span>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-center">
-            {/* QR Code view */}
-            <div className="flex flex-col items-center justify-center p-4 bg-slate-950 rounded-2xl border border-slate-800">
-              {qrCodeDataUrl ? (
-                <div className="p-2.5 bg-white rounded-xl shadow-2xl">
-                  <img src={qrCodeDataUrl} alt="WhatsApp QR Code" className="w-52 h-52 object-contain" />
-                </div>
-              ) : (
-                <div className="w-52 h-52 flex flex-col items-center justify-center text-slate-500 gap-2">
-                  <RefreshCw className="w-6 h-6 animate-spin text-emerald-500" />
-                  <span className="text-xs">Gerando QR Code...</span>
-                </div>
-              )}
-              <div className="text-[11px] text-slate-400 mt-3 text-center">
-                Aponte a câmera do WhatsApp para este código
-              </div>
-            </div>
-
-            {/* Step by step instructions */}
-            <div className="space-y-3 text-xs text-slate-300">
-              <div className="font-bold text-white text-sm mb-1 flex items-center gap-2">
-                <Smartphone className="w-4 h-4 text-emerald-400" />
-                <span>Como Conectar no Seu Smartphone:</span>
-              </div>
-              <div className="flex items-start gap-2.5 p-2.5 rounded-xl bg-slate-950/60 border border-slate-800">
-                <span className="w-5 h-5 rounded-full bg-emerald-500/20 text-emerald-400 font-bold flex items-center justify-center shrink-0 text-[10px]">
-                  1
-                </span>
-                <span>Abra o <b>WhatsApp</b> no seu celular.</span>
-              </div>
-              <div className="flex items-start gap-2.5 p-2.5 rounded-xl bg-slate-950/60 border border-slate-800">
-                <span className="w-5 h-5 rounded-full bg-emerald-500/20 text-emerald-400 font-bold flex items-center justify-center shrink-0 text-[10px]">
-                  2
-                </span>
-                <span>Toque em <b>Mais opções (⋮)</b> ou <b>Configurações (⚙️)</b> e selecione <b>Aparelhos Conectados</b>.</span>
-              </div>
-              <div className="flex items-start gap-2.5 p-2.5 rounded-xl bg-slate-950/60 border border-slate-800">
-                <span className="w-5 h-5 rounded-full bg-emerald-500/20 text-emerald-400 font-bold flex items-center justify-center shrink-0 text-[10px]">
-                  3
-                </span>
-                <span>Toque em <b>Conectar um aparelho</b> e aponte a câmera para o QR Code ao lado.</span>
-              </div>
-
-              {/* Action buttons */}
-              <div className="pt-2 space-y-2">
-                <button
-                  type="button"
-                  onClick={handleSimulateConnected}
-                  className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-xl text-xs transition-all shadow-lg shadow-emerald-950/40 flex items-center justify-center gap-2 cursor-pointer"
-                >
-                  <CheckCircle2 className="w-4 h-4" />
-                  <span>Já Escaneei / Confirmar Conexão</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setConnecting(false);
-                    setQrCodeDataUrl(null);
-                  }}
-                  className="w-full py-1.5 text-slate-400 hover:text-white text-xs text-center cursor-pointer"
-                >
-                  Fechar Janela
-                </button>
-              </div>
-            </div>
+          {/* Tabs: QR Code vs Pairing Code */}
+          <div className="flex items-center gap-2 border-b border-slate-800 pb-2">
+            <button
+              type="button"
+              onClick={() => setPairingMode('qrcode')}
+              className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
+                pairingMode === 'qrcode'
+                  ? 'bg-emerald-600 text-white shadow-md'
+                  : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+              }`}
+            >
+              <QrCode className="w-3.5 h-3.5" />
+              <span>📷 Escanear QR Code</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setPairingMode('pairing_code')}
+              className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
+                pairingMode === 'pairing_code'
+                  ? 'bg-emerald-600 text-white shadow-md'
+                  : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+              }`}
+            >
+              <Smartphone className="w-3.5 h-3.5" />
+              <span>🔢 Conectar com Código (Sem Câmera)</span>
+            </button>
           </div>
+
+          {pairingMode === 'qrcode' ? (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-center">
+              {/* QR Code view */}
+              <div className="flex flex-col items-center justify-center p-4 bg-slate-950 rounded-2xl border border-slate-800">
+                {qrCodeDataUrl ? (
+                  <div className="p-3 bg-white rounded-2xl shadow-2xl">
+                    <img src={qrCodeDataUrl} alt="WhatsApp QR Code" className="w-56 h-56 object-contain" />
+                  </div>
+                ) : (
+                  <div className="w-56 h-56 flex flex-col items-center justify-center text-slate-500 gap-2">
+                    <RefreshCw className="w-6 h-6 animate-spin text-emerald-500" />
+                    <span className="text-xs">Gerando QR Code...</span>
+                  </div>
+                )}
+                <div className="text-[11px] text-slate-400 mt-3 text-center">
+                  Aponte a câmera do WhatsApp para este código
+                </div>
+              </div>
+
+              {/* Step by step instructions */}
+              <div className="space-y-3 text-xs text-slate-300">
+                <div className="font-bold text-white text-sm mb-1 flex items-center gap-2">
+                  <Smartphone className="w-4 h-4 text-emerald-400" />
+                  <span>Como Conectar no Seu Smartphone:</span>
+                </div>
+                <div className="flex items-start gap-2.5 p-2.5 rounded-xl bg-slate-950/60 border border-slate-800">
+                  <span className="w-5 h-5 rounded-full bg-emerald-500/20 text-emerald-400 font-bold flex items-center justify-center shrink-0 text-[10px]">
+                    1
+                  </span>
+                  <span>Abra o <b>WhatsApp</b> no seu celular.</span>
+                </div>
+                <div className="flex items-start gap-2.5 p-2.5 rounded-xl bg-slate-950/60 border border-slate-800">
+                  <span className="w-5 h-5 rounded-full bg-emerald-500/20 text-emerald-400 font-bold flex items-center justify-center shrink-0 text-[10px]">
+                    2
+                  </span>
+                  <span>Toque em <b>Mais opções (⋮)</b> ou <b>Configurações (⚙️)</b> e selecione <b>Aparelhos Conectados</b>.</span>
+                </div>
+                <div className="flex items-start gap-2.5 p-2.5 rounded-xl bg-slate-950/60 border border-slate-800">
+                  <span className="w-5 h-5 rounded-full bg-emerald-500/20 text-emerald-400 font-bold flex items-center justify-center shrink-0 text-[10px]">
+                    3
+                  </span>
+                  <span>Toque em <b>Conectar um aparelho</b> e aponte a câmera para o QR Code ao lado.</span>
+                </div>
+
+                {/* Action buttons */}
+                <div className="pt-2 space-y-2">
+                  <button
+                    type="button"
+                    onClick={handleSimulateConnected}
+                    className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-xl text-xs transition-all shadow-lg shadow-emerald-950/40 flex items-center justify-center gap-2 cursor-pointer"
+                  >
+                    <CheckCircle2 className="w-4 h-4" />
+                    <span>Já Escaneei / Confirmar Conexão</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setConnecting(false);
+                      setQrCodeDataUrl(null);
+                    }}
+                    className="w-full py-1.5 text-slate-400 hover:text-white text-xs text-center cursor-pointer"
+                  >
+                    Fechar Janela
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-center">
+              {/* Pairing Code view */}
+              <div className="flex flex-col items-center justify-center p-6 bg-slate-950 rounded-2xl border border-slate-800 space-y-4">
+                <div className="w-full space-y-1.5">
+                  <label className="text-[11px] font-bold text-slate-400 uppercase tracking-wider block">
+                    Número do WhatsApp (com DDD)
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={pairingPhone}
+                      onChange={(e) => setPairingPhone(e.target.value)}
+                      placeholder="Ex: 21989850026"
+                      className="flex-1 bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500 font-mono"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleRequestPairingCode}
+                      disabled={loadingPairingCode}
+                      className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer shrink-0"
+                    >
+                      {loadingPairingCode ? (
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <Sparkles className="w-3.5 h-3.5" />
+                      )}
+                      <span>{loadingPairingCode ? 'Gerando...' : 'Gerar Código'}</span>
+                    </button>
+                  </div>
+                  {pairingCodeError && (
+                    <p className="text-[11px] text-rose-400 font-medium">{pairingCodeError}</p>
+                  )}
+                </div>
+
+                {pairingCodeValue ? (
+                  <div className="w-full p-4 bg-emerald-950/30 border-2 border-emerald-500 rounded-2xl flex flex-col items-center justify-center gap-2">
+                    <span className="text-[11px] text-emerald-400 font-bold uppercase tracking-wider">
+                      Seu Código de Conexão:
+                    </span>
+                    <div className="font-mono text-3xl font-black text-white tracking-widest bg-slate-900/90 px-5 py-2.5 rounded-xl border border-emerald-500/40 select-all">
+                      {pairingCodeValue}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        navigator.clipboard.writeText(pairingCodeValue.replace('-', ''));
+                        setPairingCodeCopied(true);
+                        setTimeout(() => setPairingCodeCopied(false), 2500);
+                      }}
+                      className="text-xs text-slate-300 hover:text-white flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg transition-all cursor-pointer font-medium"
+                    >
+                      <Copy className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>{pairingCodeCopied ? 'Código Copiado!' : 'Copiar Código'}</span>
+                    </button>
+                  </div>
+                ) : (
+                  <div className="w-full py-8 text-center text-slate-500 text-xs flex flex-col items-center justify-center gap-1.5">
+                    <Smartphone className="w-8 h-8 text-slate-600" />
+                    <span>Clique em <b>Gerar Código</b> para obter o código de 8 dígitos</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Pairing code instructions */}
+              <div className="space-y-3 text-xs text-slate-300">
+                <div className="font-bold text-white text-sm mb-1 flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                  <span>Como Inserir o Código no WhatsApp:</span>
+                </div>
+                <div className="flex items-start gap-2.5 p-2.5 rounded-xl bg-slate-950/60 border border-slate-800">
+                  <span className="w-5 h-5 rounded-full bg-emerald-500/20 text-emerald-400 font-bold flex items-center justify-center shrink-0 text-[10px]">
+                    1
+                  </span>
+                  <span>Abra o <b>WhatsApp</b> no celular &gt; <b>Aparelhos Conectados</b>.</span>
+                </div>
+                <div className="flex items-start gap-2.5 p-2.5 rounded-xl bg-slate-950/60 border border-slate-800">
+                  <span className="w-5 h-5 rounded-full bg-emerald-500/20 text-emerald-400 font-bold flex items-center justify-center shrink-0 text-[10px]">
+                    2
+                  </span>
+                  <span>Toque em <b>Conectar um aparelho</b>.</span>
+                </div>
+                <div className="flex items-start gap-2.5 p-2.5 rounded-xl bg-slate-950/60 border border-slate-800">
+                  <span className="w-5 h-5 rounded-full bg-emerald-500/20 text-emerald-400 font-bold flex items-center justify-center shrink-0 text-[10px]">
+                    3
+                  </span>
+                  <span>Na parte inferior, toque em <b>Conectar com número de telefone</b>.</span>
+                </div>
+                <div className="flex items-start gap-2.5 p-2.5 rounded-xl bg-slate-950/60 border border-slate-800">
+                  <span className="w-5 h-5 rounded-full bg-emerald-500/20 text-emerald-400 font-bold flex items-center justify-center shrink-0 text-[10px]">
+                    4
+                  </span>
+                  <span>Digite o código gerado ao lado. O sistema conectará instantaneamente!</span>
+                </div>
+
+                {/* Action buttons */}
+                <div className="pt-2 space-y-2">
+                  <button
+                    type="button"
+                    onClick={handleSimulateConnected}
+                    className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-xl text-xs transition-all shadow-lg shadow-emerald-950/40 flex items-center justify-center gap-2 cursor-pointer"
+                  >
+                    <CheckCircle2 className="w-4 h-4" />
+                    <span>Já Digitei no Celular / Confirmar</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setConnecting(false);
+                      setQrCodeDataUrl(null);
+                    }}
+                    className="w-full py-1.5 text-slate-400 hover:text-white text-xs text-center cursor-pointer"
+                  >
+                    Fechar Janela
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -1546,45 +1773,364 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({ 
               </div>
             </div>
 
-            {/* Horário de Disparo */}
-            <div className="p-3.5 bg-slate-950/70 border border-slate-800 rounded-xl space-y-2">
-              <div className="flex items-center justify-between">
-                <label className="text-xs font-semibold uppercase text-slate-300 tracking-wider block">
-                  Horário Diário de Disparo *
-                </label>
-                <span className="text-[10px] text-emerald-400 font-bold bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/20">
-                  Obrigatório
-                </span>
-              </div>
-              <div className="flex items-center gap-2">
-                <input
-                  type="time"
-                  value={config.scheduled_time}
-                  onChange={(e) => updateConfigField('scheduled_time', e.target.value)}
-                  className="px-3.5 py-2.5 bg-slate-900 border border-slate-800 rounded-xl text-sm font-mono font-bold text-white focus:outline-none focus:border-emerald-500 w-32"
-                />
-                <span className="text-xs text-slate-400">Horário de Brasília</span>
-              </div>
+            {/* Horário Diário de Disparo com Períodos: Manhã, Tarde e Noite */}
+            {(() => {
+              const isMorningActive = config.morning_schedule_enabled !== false;
+              const morningTime = config.morning_schedule_time || config.scheduled_time || '09:00';
+              const isAfternoonActive = Boolean(config.afternoon_schedule_enabled || config.second_scheduled_time_enabled);
+              const afternoonTime = config.afternoon_schedule_time || config.second_scheduled_time || '14:30';
+              const isNightActive = Boolean(config.night_schedule_enabled);
+              const nightTime = config.night_schedule_time || '19:00';
+              const activePeriodsCount = (isMorningActive ? 1 : 0) + (isAfternoonActive ? 1 : 0) + (isNightActive ? 1 : 0);
 
-              {/* Quick suggestions */}
-              <div className="flex items-center gap-1.5 mt-2 flex-wrap">
-                <span className="text-[10px] text-slate-500 font-semibold mr-1">Sugestões:</span>
-                {['08:00', '08:30', '09:00', '10:00', '11:00'].map((time) => (
-                  <button
-                    key={time}
-                    type="button"
-                    onClick={() => updateConfigField('scheduled_time', time)}
-                    className={`px-2 py-0.5 rounded text-[10px] font-mono font-semibold transition-all cursor-pointer ${
-                      config.scheduled_time === time
-                        ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40'
-                        : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
-                    }`}
-                  >
-                    {time}
-                  </button>
-                ))}
-              </div>
-            </div>
+              return (
+                <div className="p-3.5 sm:p-4 bg-slate-950/80 border border-slate-800 rounded-xl space-y-3.5">
+                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 pb-2.5 border-b border-slate-800/80">
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <label className="text-xs font-bold uppercase text-slate-200 tracking-wider">
+                          Horário Diário de Disparo *
+                        </label>
+                        <span className="text-[10px] text-emerald-400 font-bold bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/20">
+                          3 Períodos
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-400 mt-0.5">
+                        Ative ou desative as cobranças nos períodos da <span className="text-amber-300 font-semibold">Manhã</span>, <span className="text-sky-300 font-semibold">Tarde</span> e <span className="text-purple-300 font-semibold">Noite</span> e defina o horário de disparo para cada um.
+                      </p>
+                    </div>
+
+                    <div className="flex items-center gap-1.5 self-start sm:self-auto">
+                      <span className="text-[10px] text-slate-400 font-medium">Horário de Brasília:</span>
+                      <span
+                        className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
+                          activePeriodsCount > 0
+                            ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                            : 'bg-rose-500/10 text-rose-400 border-rose-500/20'
+                        }`}
+                      >
+                        {activePeriodsCount === 0
+                          ? 'Nenhum período ativo'
+                          : `${activePeriodsCount} ${activePeriodsCount === 1 ? 'período ativo' : 'períodos ativos'}`}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* 3 Cards de Períodos: Manhã, Tarde, Noite */}
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    {/* 1. Manhã */}
+                    <div
+                      className={`p-3.5 rounded-xl border transition-all ${
+                        isMorningActive
+                          ? 'bg-amber-950/15 border-amber-500/40 ring-1 ring-amber-500/20 shadow-sm shadow-amber-950/30'
+                          : 'bg-slate-900/40 border-slate-800/80 opacity-60 hover:opacity-80'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between pb-2 mb-2.5 border-b border-slate-800/60">
+                        <div className="flex items-center gap-2">
+                          <div
+                            className={`p-1.5 rounded-lg ${
+                              isMorningActive ? 'bg-amber-500/20 text-amber-400' : 'bg-slate-800 text-slate-400'
+                            }`}
+                          >
+                            <Sun className="w-4 h-4" />
+                          </div>
+                          <div>
+                            <div className="text-xs font-bold text-white flex items-center gap-1.5">
+                              <span>Manhã</span>
+                              {isMorningActive && (
+                                <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse"></span>
+                              )}
+                            </div>
+                            <div className="text-[10px] text-slate-400">Primeiros lembretes</div>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <span className={`text-[10px] font-bold ${isMorningActive ? 'text-amber-400' : 'text-slate-500'}`}>
+                            {isMorningActive ? 'Ativo' : 'Desativado'}
+                          </span>
+                          <ToggleSwitch
+                            checked={isMorningActive}
+                            onChange={(val) => {
+                              updateConfigFields({
+                                morning_schedule_enabled: val,
+                                scheduled_time: config.morning_schedule_time || '09:00',
+                              });
+                            }}
+                            color="amber"
+                            ariaLabel="Ativar ou desativar cobrança no período da manhã"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="space-y-2">
+                        <label className="text-[10px] font-semibold uppercase tracking-wider text-slate-400 block">
+                          Horário do Disparo
+                        </label>
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="time"
+                            disabled={!isMorningActive}
+                            value={morningTime}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              updateConfigFields({
+                                morning_schedule_time: val,
+                                scheduled_time: val,
+                              });
+                            }}
+                            className={`px-3 py-2 bg-slate-900 border rounded-lg text-xs font-mono font-bold text-white focus:outline-none w-full ${
+                              isMorningActive
+                                ? 'border-amber-500/50 focus:border-amber-400'
+                                : 'border-slate-800 opacity-50 cursor-not-allowed'
+                            }`}
+                          />
+                        </div>
+
+                        {/* Quick suggestions */}
+                        <div className="flex items-center gap-1 flex-wrap pt-1">
+                          {['07:30', '08:00', '08:30', '09:00', '10:00', '11:00'].map((time) => (
+                            <button
+                              key={time}
+                              type="button"
+                              disabled={!isMorningActive}
+                              onClick={() => {
+                                updateConfigFields({
+                                  morning_schedule_time: time,
+                                  scheduled_time: time,
+                                });
+                              }}
+                              className={`px-1.5 py-0.5 rounded text-[10px] font-mono font-semibold transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
+                                morningTime === time && isMorningActive
+                                  ? 'bg-amber-500/25 text-amber-300 border border-amber-500/50'
+                                  : 'bg-slate-900/80 text-slate-400 hover:text-white border border-slate-800'
+                              }`}
+                            >
+                              {time}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* 2. Tarde */}
+                    <div
+                      className={`p-3.5 rounded-xl border transition-all ${
+                        isAfternoonActive
+                          ? 'bg-sky-950/15 border-sky-500/40 ring-1 ring-sky-500/20 shadow-sm shadow-sky-950/30'
+                          : 'bg-slate-900/40 border-slate-800/80 opacity-60 hover:opacity-80'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between pb-2 mb-2.5 border-b border-slate-800/60">
+                        <div className="flex items-center gap-2">
+                          <div
+                            className={`p-1.5 rounded-lg ${
+                              isAfternoonActive ? 'bg-sky-500/20 text-sky-400' : 'bg-slate-800 text-slate-400'
+                            }`}
+                          >
+                            <CloudSun className="w-4 h-4" />
+                          </div>
+                          <div>
+                            <div className="text-xs font-bold text-white flex items-center gap-1.5">
+                              <span>Tarde</span>
+                              {isAfternoonActive && (
+                                <span className="w-1.5 h-1.5 rounded-full bg-sky-400 animate-pulse"></span>
+                              )}
+                            </div>
+                            <div className="text-[10px] text-slate-400">Reforço vespertino</div>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <span className={`text-[10px] font-bold ${isAfternoonActive ? 'text-sky-400' : 'text-slate-500'}`}>
+                            {isAfternoonActive ? 'Ativo' : 'Desativado'}
+                          </span>
+                          <ToggleSwitch
+                            checked={isAfternoonActive}
+                            onChange={(val) => {
+                              updateConfigFields({
+                                afternoon_schedule_enabled: val,
+                                second_scheduled_time_enabled: val,
+                                second_scheduled_time: config.afternoon_schedule_time || '14:30',
+                              });
+                            }}
+                            color="blue"
+                            ariaLabel="Ativar ou desativar cobrança no período da tarde"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="space-y-2">
+                        <label className="text-[10px] font-semibold uppercase tracking-wider text-slate-400 block">
+                          Horário do Disparo
+                        </label>
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="time"
+                            disabled={!isAfternoonActive}
+                            value={afternoonTime}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              updateConfigFields({
+                                afternoon_schedule_time: val,
+                                second_scheduled_time: val,
+                              });
+                            }}
+                            className={`px-3 py-2 bg-slate-900 border rounded-lg text-xs font-mono font-bold text-white focus:outline-none w-full ${
+                              isAfternoonActive
+                                ? 'border-sky-500/50 focus:border-sky-400'
+                                : 'border-slate-800 opacity-50 cursor-not-allowed'
+                            }`}
+                          />
+                        </div>
+
+                        {/* Quick suggestions */}
+                        <div className="flex items-center gap-1 flex-wrap pt-1">
+                          {['13:00', '13:30', '14:00', '14:30', '15:00', '16:00'].map((time) => (
+                            <button
+                              key={time}
+                              type="button"
+                              disabled={!isAfternoonActive}
+                              onClick={() => {
+                                updateConfigFields({
+                                  afternoon_schedule_time: time,
+                                  second_scheduled_time: time,
+                                });
+                              }}
+                              className={`px-1.5 py-0.5 rounded text-[10px] font-mono font-semibold transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
+                                afternoonTime === time && isAfternoonActive
+                                  ? 'bg-sky-500/25 text-sky-300 border border-sky-500/50'
+                                  : 'bg-slate-900/80 text-slate-400 hover:text-white border border-slate-800'
+                              }`}
+                            >
+                              {time}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* 3. Noite */}
+                    <div
+                      className={`p-3.5 rounded-xl border transition-all ${
+                        isNightActive
+                          ? 'bg-purple-950/15 border-purple-500/40 ring-1 ring-purple-500/20 shadow-sm shadow-purple-950/30'
+                          : 'bg-slate-900/40 border-slate-800/80 opacity-60 hover:opacity-80'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between pb-2 mb-2.5 border-b border-slate-800/60">
+                        <div className="flex items-center gap-2">
+                          <div
+                            className={`p-1.5 rounded-lg ${
+                              isNightActive ? 'bg-purple-500/20 text-purple-400' : 'bg-slate-800 text-slate-400'
+                            }`}
+                          >
+                            <Moon className="w-4 h-4" />
+                          </div>
+                          <div>
+                            <div className="text-xs font-bold text-white flex items-center gap-1.5">
+                              <span>Noite</span>
+                              {isNightActive && (
+                                <span className="w-1.5 h-1.5 rounded-full bg-purple-400 animate-pulse"></span>
+                              )}
+                            </div>
+                            <div className="text-[10px] text-slate-400">Repescagem noturna</div>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <span className={`text-[10px] font-bold ${isNightActive ? 'text-purple-400' : 'text-slate-500'}`}>
+                            {isNightActive ? 'Ativo' : 'Desativado'}
+                          </span>
+                          <ToggleSwitch
+                            checked={isNightActive}
+                            onChange={(val) => {
+                              updateConfigFields({
+                                night_schedule_enabled: val,
+                              });
+                            }}
+                            color="purple"
+                            ariaLabel="Ativar ou desativar cobrança no período da noite"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="space-y-2">
+                        <label className="text-[10px] font-semibold uppercase tracking-wider text-slate-400 block">
+                          Horário do Disparo
+                        </label>
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="time"
+                            disabled={!isNightActive}
+                            value={nightTime}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              updateConfigFields({
+                                night_schedule_time: val,
+                              });
+                            }}
+                            className={`px-3 py-2 bg-slate-900 border rounded-lg text-xs font-mono font-bold text-white focus:outline-none w-full ${
+                              isNightActive
+                                ? 'border-purple-500/50 focus:border-purple-400'
+                                : 'border-slate-800 opacity-50 cursor-not-allowed'
+                            }`}
+                          />
+                        </div>
+
+                        {/* Quick suggestions */}
+                        <div className="flex items-center gap-1 flex-wrap pt-1">
+                          {['18:00', '18:30', '19:00', '19:30', '20:00', '20:30'].map((time) => (
+                            <button
+                              key={time}
+                              type="button"
+                              disabled={!isNightActive}
+                              onClick={() => {
+                                updateConfigFields({
+                                  night_schedule_time: time,
+                                });
+                              }}
+                              className={`px-1.5 py-0.5 rounded text-[10px] font-mono font-semibold transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
+                                nightTime === time && isNightActive
+                                  ? 'bg-purple-500/25 text-purple-300 border border-purple-500/50'
+                                  : 'bg-slate-900/80 text-slate-400 hover:text-white border border-slate-800'
+                              }`}
+                            >
+                              {time}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Informative helper note */}
+                  {activePeriodsCount === 0 ? (
+                    <div className="p-2.5 rounded-lg bg-rose-500/10 border border-rose-500/20 text-rose-300 text-xs flex items-center gap-2">
+                      <AlertCircle className="w-4 h-4 shrink-0 text-rose-400" />
+                      <span>
+                        Atenção: Todos os períodos de disparo estão desativados. Ative pelo menos um (Manhã, Tarde ou Noite) para que os lembretes automáticos diários sejam enviados.
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="p-2.5 rounded-lg bg-slate-900/70 border border-slate-800 text-slate-300 text-[11px] flex items-center justify-between gap-2 flex-wrap">
+                      <div className="flex items-center gap-1.5">
+                        <Clock className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                        <span>
+                          Turnos programados hoje:{' '}
+                          {[
+                            isMorningActive ? `☀️ Manhã às ${morningTime}` : null,
+                            isAfternoonActive ? `⛅ Tarde às ${afternoonTime}` : null,
+                            isNightActive ? `🌙 Noite às ${nightTime}` : null,
+                          ].filter(Boolean).join(' • ')} (Horário de Brasília)
+                        </span>
+                      </div>
+                      <span className="text-[10px] text-slate-400">
+                        O sistema verifica pendências e envia nos horários definidos com segurança anti-bloqueio.
+                      </span>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
 
             {/* Anti-Ban & Weekend row */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2 border-t border-slate-800/80">
@@ -1741,6 +2287,11 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({ 
                   </p>
                 </div>
               </div>
+            </div>
+
+            {/* 2.1 Centro de Diagnóstico e Gatilho Imediato dos 4 Módulos */}
+            <div className="pt-4 border-t border-slate-800">
+              <ModuleAutomationDiagnostic tenant={tenant} onRefreshParent={loadPendingNotices} />
             </div>
           </div>
 
