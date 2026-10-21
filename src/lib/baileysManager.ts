@@ -758,93 +758,74 @@ export async function sendBaileysMessage({
 }
 
 export async function disconnectBaileysInstance(targetInstanceName?: string) {
-  const targets = new Set<string>();
-  if (targetInstanceName && typeof targetInstanceName === 'string' && targetInstanceName.trim()) {
-    targets.add(targetInstanceName.trim());
+  // Segurança: nunca desconectar todas as sessões por falta de um nome específico.
+  const name = typeof targetInstanceName === 'string' ? targetInstanceName.trim() : '';
+  if (!name) {
+    console.warn('[BaileysManager] Desconexão cancelada: informe o nome exato da instância.');
+    return { success: false, error: 'Informe o nome da instância que deseja desconectar.' };
   }
 
-  // Identifica e inclui qualquer instância que esteja aberta ou com socket ativo
-  for (const [name, sess] of instancesMap.entries()) {
-    if (sess.state === 'open' || sess.socket) {
-      targets.add(name);
-    }
+  // Trabalha exclusivamente com a instância solicitada. Não adicionar outras
+  // sessões ativas, nem varrer diretórios de sessão como fallback.
+  console.log(`[BaileysManager] 🚪 Processando desconexão da instância WhatsApp: "${name}"`);
+
+  // 1. Cancela debounce de sincronização para evitar salvar credenciais de volta no Supabase.
+  const syncTimer = syncDebounceTimers.get(name);
+  if (syncTimer) {
+    clearTimeout(syncTimer);
+    syncDebounceTimers.delete(name);
   }
 
-  const activeName = getActiveOpenInstanceName();
-  if (activeName) {
-    targets.add(activeName);
-  }
+  // 2. Remove apenas a promessa de inicialização desta instância.
+  initPromises.delete(name);
 
-  // Se nenhuma foi identificada, inclui instâncias salvas em diretórios
-  if (targets.size === 0) {
-    const dirs = getAvailableSessionDirs();
-    for (const d of dirs) targets.add(d);
-  }
+  const session = instancesMap.get(name);
+  if (session) {
+    (session as any).isExplicitDisconnect = true;
+    session.state = 'close';
+    session.lastError = 'Desconectado pelo usuário';
 
-  for (const name of targets) {
-    console.log(`[BaileysManager] 🚪 Processando desconexão da instância WhatsApp: "${name}"`);
-
-    // 1. Cancela debounce de sincronização para evitar salvar creds de volta no Supabase
-    const syncTimer = syncDebounceTimers.get(name);
-    if (syncTimer) {
-      clearTimeout(syncTimer);
-      syncDebounceTimers.delete(name);
-    }
-
-    // 2. Remove promessas de inicialização pendentes
-    initPromises.delete(name);
-
-    const session = instancesMap.get(name);
-    if (session) {
-      (session as any).isExplicitDisconnect = true;
-      session.state = 'close';
-      session.lastError = 'Desconectado pelo usuário';
-
-      if (session.socket) {
-        const sock = session.socket;
+    if (session.socket) {
+      const sock = session.socket;
+      try {
+        console.log(`[BaileysManager] 📲 Deslogando dispositivo conectado no WhatsApp para "${name}"...`);
+        await Promise.race([
+          sock.logout('Desconexão manual solicitada pelo usuário no painel'),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout ao aguardar logout do WhatsApp')), 4500)),
+        ]);
+        console.log(`[BaileysManager] ✅ Sessão "${name}" deslogada com sucesso do WhatsApp!`);
+      } catch (err: any) {
+        console.warn(`[BaileysManager] Aviso durante logout do WhatsApp para "${name}":`, err?.message);
         try {
-          console.log(`[BaileysManager] 📲 Deslogando dispositivo conectado no WhatsApp para "${name}"...`);
-          // O comando logout envia a stanza <remove-companion-device> para o servidor do WhatsApp,
-          // fazendo o WhatsApp no aparelho celular deslogar a sessão imediatamente em tempo real!
-          await Promise.race([
-            sock.logout('Desconexão manual solicitada pelo usuário no painel'),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout ao aguardar logout do WhatsApp')), 4500)),
-          ]);
-          console.log(`[BaileysManager] ✅ Sessão "${name}" deslogada com sucesso do WhatsApp!`);
-        } catch (err: any) {
-          console.warn(`[BaileysManager] Aviso durante logout do WhatsApp para "${name}":`, err?.message);
-          try {
-            sock.end(new Boom('Intentional Logout', { statusCode: DisconnectReason.loggedOut }));
-          } catch {}
-        }
-
-        try {
-          sock.ev.removeAllListeners('connection.update');
-          sock.ev.removeAllListeners('creds.update');
+          sock.end(new Boom('Intentional Logout', { statusCode: DisconnectReason.loggedOut }));
         } catch {}
       }
 
-      session.socket = null;
-      session.ownerPhone = null;
-      session.ownerName = null;
-      session.connectedAt = null;
-      session.qrCodeRaw = null;
-      session.qrCodeDataUrl = null;
+      try {
+        sock.ev.removeAllListeners('connection.update');
+        sock.ev.removeAllListeners('creds.update');
+      } catch {}
     }
 
-    instancesMap.delete(name);
-
-    // 3. Exclui a pasta da sessão no disco local
-    const sessionDir = getSessionPath(name);
-    try {
-      fs.rmSync(sessionDir, { recursive: true, force: true });
-    } catch (e) {
-      console.warn(`[BaileysManager] Erro ao remover diretório local de "${name}":`, e);
-    }
-
-    // 4. Remove credenciais do Supabase para evitar restauração automática
-    await deleteSessionFilesFromSupabase(name).catch(() => {});
+    session.socket = null;
+    session.ownerPhone = null;
+    session.ownerName = null;
+    session.connectedAt = null;
+    session.qrCodeRaw = null;
+    session.qrCodeDataUrl = null;
   }
+
+  // Remove somente a instância solicitada do mapa e seus arquivos de sessão.
+  instancesMap.delete(name);
+
+  const sessionDir = getSessionPath(name);
+  try {
+    fs.rmSync(sessionDir, { recursive: true, force: true });
+  } catch (e) {
+    console.warn(`[BaileysManager] Erro ao remover diretório local de "${name}":`, e);
+  }
+
+  await deleteSessionFilesFromSupabase(name).catch(() => {});
 
   return { success: true };
 }
